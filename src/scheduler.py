@@ -92,9 +92,9 @@ class TaskScheduler:
         """
         每日分析任务
         执行流程：
-        1. 检查是否为交易日
-        2. 下载/更新股票列表
-        3. 下载最新交易数据
+        1. 下载/更新股票列表
+        2. 下载最新交易数据
+        3. 检查是否为交易日
         4. 执行股票筛选
         5. 保存结果
         """
@@ -110,15 +110,8 @@ class TaskScheduler:
             self.logger.info("开始执行每日分析任务")
             self.logger.info(f"执行时间: {self.last_run_time.strftime('%Y-%m-%d %H:%M:%S')}")
             self.logger.info("=" * 50)
-            
-            # 1. 检查是否为交易日
-            if self.weekdays_only and not is_trading_day(datetime.now()):
-                message = "今天不是交易日，跳过任务"
-                self.logger.info(message)
-                self._notify_complete(True, message, 0)
-                return
-            
-            # 2. 下载股票列表
+                        
+            # 1. 下载股票列表
             self.logger.info("步骤1: 下载股票列表...")
             self._notify_progress('下载股票列表', 0, 1, '正在获取股票列表...')
             
@@ -133,7 +126,7 @@ class TaskScheduler:
             self.logger.info(f"获取到 {stock_count} 只股票")
             self._notify_progress('下载股票列表', 1, 1, f'已获取 {stock_count} 只股票')
             
-            # 3. 下载股票数据
+            # 2. 下载股票数据
             self.logger.info("步骤2: 下载股票数据...")
             
             def download_progress(current, total, stock_code, success):
@@ -155,6 +148,13 @@ class TaskScheduler:
             self._notify_progress('下载股票数据', success_count, stock_count, 
                                 f'下载完成: {success_count}/{stock_count}')
             
+            # 3. 检查是否为交易日
+            if self.weekdays_only and not is_trading_day(datetime.now()):
+                message = "今天不是交易日，跳过任务"
+                self.logger.info(message)
+                self._notify_complete(True, message, 0)
+                return
+
             # 4. 执行筛选
             self.logger.info("步骤3: 执行股票筛选...")
             
