@@ -72,21 +72,54 @@ class BaoStockDataSource:
             
             stock_list = pd.DataFrame(data_list, columns=rs.fields)
             
+            self.logger.info(f"从BaoStock获取到 {len(stock_list)} 条记录")
+            self.logger.info(f"字段列表: {list(stock_list.columns)}")
+            
+            # 检查是否为空
+            if len(stock_list) == 0:
+                self.logger.warning("BaoStock返回的股票列表为空")
+                return pd.DataFrame(columns=['code', 'name'])
+            
             # 过滤只保留A股
-            stock_list = stock_list[stock_list['code'].str.contains(r'^(sh\.|sz\.)', regex=True)]
+            if 'code' in stock_list.columns:
+                stock_list = stock_list[stock_list['code'].str.contains(r'^(sh\.|sz\.)', regex=True)]
+            else:
+                self.logger.error(f"返回的数据中没有'code'字段，可用字段: {list(stock_list.columns)}")
+                return None
             
             # 标准化格式
             stock_list['code'] = stock_list['code'].str.replace('sh.', '').str.replace('sz.', '')
-            stock_list.rename(columns={
-                'code': 'code',
-                'code_name': 'name',
-                'tradeStatus': 'status'
-            }, inplace=True)
+            
+            # 检查并重命名列
+            rename_map = {}
+            if 'code_name' in stock_list.columns:
+                rename_map['code_name'] = 'name'
+            if 'tradeStatus' in stock_list.columns:
+                rename_map['tradeStatus'] = 'status'
+            
+            if rename_map:
+                stock_list.rename(columns=rename_map, inplace=True)
+                self.logger.info(f"列重命名: {rename_map}")
+            else:
+                self.logger.warning(f"未找到需要重命名的列，当前列: {list(stock_list.columns)}")
             
             # 只保留交易状态为1的股票（正在交易）
-            stock_list = stock_list[stock_list['status'] == '1']
+            if 'status' in stock_list.columns:
+                stock_list = stock_list[stock_list['status'] == '1']
+            else:
+                self.logger.warning("没有找到'status'字段，无法按交易状态过滤")
             
             self.logger.info(f"获取到 {len(stock_list)} 只股票")
+            
+            # 检查必需的列是否存在
+            if 'code' not in stock_list.columns:
+                self.logger.error(f"结果中缺少'code'列，当前列: {list(stock_list.columns)}")
+                return None
+            
+            if 'name' not in stock_list.columns:
+                self.logger.warning(f"结果中缺少'name'列，将使用股票代码作为名称")
+                stock_list['name'] = stock_list['code']
+            
             return stock_list[['code', 'name']]
             
         except Exception as e:

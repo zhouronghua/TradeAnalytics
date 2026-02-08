@@ -60,6 +60,11 @@ class StockAnalyzerGUI:
         self.is_running = False
         self.current_result_file = None
         
+        # K线图导航相关变量
+        self.current_stock_list = []  # 当前股票列表
+        self.current_stock_index = -1  # 当前显示的股票索引
+        self.chart_window = None  # 图表窗口引用
+        
         # 设置窗口
         self.setup_window()
         
@@ -592,8 +597,24 @@ class StockAnalyzerGUI:
         
         stock_code = str(values[0]).zfill(6)  # 确保是6位字符串，前面补0
         
+        # 获取当前股票列表和索引
+        self.current_stock_list = []
+        for child in self.result_tree.get_children():
+            item_data = self.result_tree.item(child)
+            if item_data['values']:
+                code = str(item_data['values'][0]).zfill(6)
+                name = item_data['values'][1] if len(item_data['values']) > 1 else code
+                self.current_stock_list.append({'code': code, 'name': name})
+        
+        # 找到当前股票的索引
+        self.current_stock_index = -1
+        for idx, stock in enumerate(self.current_stock_list):
+            if stock['code'] == stock_code:
+                self.current_stock_index = idx
+                break
+        
         # 显示量价图
-        self.show_volume_price_chart(stock_code)
+        self.show_volume_price_chart_with_nav(stock_code)
     
     def show_stock_detail(self, stock_code: str, stock_name: str):
         """显示股票详细数据"""
@@ -1017,9 +1038,14 @@ class StockAnalyzerGUI:
         except Exception as e:
             self.log(f"加载结果失败: {e}")
     
-    def show_volume_price_chart(self, stock_code: str):
-        """显示股票量价图"""
+    def show_volume_price_chart_with_nav(self, stock_code: str):
+        """显示带导航功能的股票量价图"""
         try:
+            # 如果已有图表窗口，先关闭
+            if self.chart_window and self.chart_window.winfo_exists():
+                self.chart_window.destroy()
+            
+            # 读取股票数据
             csv_file = os.path.join(self.downloader.daily_dir, f'{stock_code}.csv')
             
             if not os.path.exists(csv_file):
@@ -1035,6 +1061,7 @@ class StockAnalyzerGUI:
             df['date'] = pd.to_datetime(df['date'])
             df = df.sort_values('date')
             
+            # 计算均线
             if len(df) >= 120:
                 df['ma'] = df['close'].rolling(window=120).mean()
                 ma_label = '120日均线'
@@ -1047,22 +1074,48 @@ class StockAnalyzerGUI:
             
             recent_df = df.tail(60).reset_index(drop=True)
             
-            chart_window = tk.Toplevel(self.root)
-            chart_window.title(f"股票 {stock_code} 量价图")
-            chart_window.geometry("1000x700")
+            # 创建图表窗口
+            self.chart_window = tk.Toplevel(self.root)
             
+            # 获取股票名称
+            stock_name = stock_code
+            if self.current_stock_index >= 0 and self.current_stock_index < len(self.current_stock_list):
+                stock_name = self.current_stock_list[self.current_stock_index].get('name', stock_code)
+            
+            # 生成标题文本（避免重复显示代码）
+            if stock_name == stock_code:
+                stock_display = stock_code
+            else:
+                stock_display = f"{stock_code} {stock_name}"
+            
+            # 窗口标题显示导航信息
+            nav_info = ""
+            if len(self.current_stock_list) > 1:
+                nav_info = f" [{self.current_stock_index + 1}/{len(self.current_stock_list)}]"
+            
+            self.chart_window.title(f"股票 {stock_display} - 量价图{nav_info}")
+            self.chart_window.geometry("1000x750")
+            
+            # 绑定键盘事件
+            self.chart_window.bind('<Left>', lambda e: self.navigate_prev_stock())
+            self.chart_window.bind('<Right>', lambda e: self.navigate_next_stock())
+            self.chart_window.bind('<Escape>', lambda e: self.chart_window.destroy())
+            
+            # 设置matplotlib字体
             plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
             plt.rcParams['axes.unicode_minus'] = False
             
+            # 创建图表
             fig = Figure(figsize=(10, 7), dpi=100)
             
+            # 价格走势图
             ax1 = fig.add_subplot(211)
             ax1.plot(range(len(recent_df)), recent_df['close'].values, 
                     label='收盘价', linewidth=2, color='blue')
             ax1.plot(range(len(recent_df)), recent_df['ma'].values, 
                     label=ma_label, linewidth=1.5, color='orange', linestyle='--')
             
-            ax1.set_title(f'{stock_code} 价格走势', fontsize=14, fontweight='bold')
+            ax1.set_title(f'{stock_display} 价格走势', fontsize=14, fontweight='bold')
             ax1.set_ylabel('价格 (元)', fontsize=12)
             ax1.legend(loc='best')
             ax1.grid(True, alpha=0.3)
@@ -1072,6 +1125,7 @@ class StockAnalyzerGUI:
             ax1.set_xticks(range(0, len(date_labels), step))
             ax1.set_xticklabels([date_labels[i] for i in range(0, len(date_labels), step)], rotation=45)
             
+            # 成交量图
             ax2 = fig.add_subplot(212)
             colors = ['red' if i < len(recent_df) and recent_df.iloc[i]['close'] >= recent_df.iloc[i]['open'] 
                      else 'green' for i in range(len(recent_df))]
@@ -1086,21 +1140,77 @@ class StockAnalyzerGUI:
             
             fig.tight_layout()
             
-            canvas = FigureCanvasTkAgg(fig, master=chart_window)
+            # 创建画布
+            canvas = FigureCanvasTkAgg(fig, master=self.chart_window)
             canvas.draw()
             canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
             
-            btn_frame = ttk.Frame(chart_window)
+            # 按钮框架
+            btn_frame = ttk.Frame(self.chart_window)
             btn_frame.pack(fill=tk.X, padx=10, pady=5)
             
+            # 导航按钮（左侧）
+            nav_frame = ttk.Frame(btn_frame)
+            nav_frame.pack(side=tk.LEFT)
+            
+            btn_prev = ttk.Button(nav_frame, text="← 上一个 (Left)", 
+                                 command=self.navigate_prev_stock)
+            btn_prev.pack(side=tk.LEFT, padx=5)
+            
+            btn_next = ttk.Button(nav_frame, text="下一个 (Right) →", 
+                                 command=self.navigate_next_stock)
+            btn_next.pack(side=tk.LEFT, padx=5)
+            
+            # 启用/禁用导航按钮
+            if self.current_stock_index <= 0:
+                btn_prev.config(state='disabled')
+            if self.current_stock_index >= len(self.current_stock_list) - 1:
+                btn_next.config(state='disabled')
+            
+            # 提示标签（中间）
+            if len(self.current_stock_list) > 1:
+                hint_label = ttk.Label(btn_frame, 
+                                      text=f"提示: 使用左右方向键快速切换股票 ({self.current_stock_index + 1}/{len(self.current_stock_list)})",
+                                      foreground='gray')
+                hint_label.pack(side=tk.LEFT, padx=20)
+            
+            # 功能按钮（右侧）
             ttk.Button(btn_frame, text="保存图表", 
-                      command=lambda: self.save_chart(fig, stock_code)).pack(side=tk.LEFT, padx=5)
-            ttk.Button(btn_frame, text="关闭", 
-                      command=chart_window.destroy).pack(side=tk.RIGHT, padx=5)
+                      command=lambda: self.save_chart(fig, stock_code)).pack(side=tk.RIGHT, padx=5)
+            ttk.Button(btn_frame, text="关闭 (Esc)", 
+                      command=self.chart_window.destroy).pack(side=tk.RIGHT, padx=5)
+            
+            # 让窗口获得焦点，以便响应键盘事件
+            self.chart_window.focus_force()
             
         except Exception as e:
             self.log(f"显示图表失败: {e}")
             messagebox.showerror("错误", f"显示图表失败: {e}")
+    
+    def navigate_prev_stock(self):
+        """导航到上一个股票"""
+        if self.current_stock_index <= 0:
+            return
+        
+        self.current_stock_index -= 1
+        stock = self.current_stock_list[self.current_stock_index]
+        self.show_volume_price_chart_with_nav(stock['code'])
+    
+    def navigate_next_stock(self):
+        """导航到下一个股票"""
+        if self.current_stock_index >= len(self.current_stock_list) - 1:
+            return
+        
+        self.current_stock_index += 1
+        stock = self.current_stock_list[self.current_stock_index]
+        self.show_volume_price_chart_with_nav(stock['code'])
+    
+    def show_volume_price_chart(self, stock_code: str):
+        """显示股票量价图（兼容旧方法）"""
+        # 清空导航列表，使用单个股票模式
+        self.current_stock_list = [{'code': stock_code, 'name': stock_code}]
+        self.current_stock_index = 0
+        self.show_volume_price_chart_with_nav(stock_code)
     
     def save_chart(self, fig: Figure, stock_code: str):
         """保存图表"""
