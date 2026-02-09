@@ -7,6 +7,48 @@ import os
 import glob
 from typing import List, Dict, Optional
 
+# 全局股票列表缓存
+_stock_list_cache = None
+
+
+def load_stock_list() -> Optional[pd.DataFrame]:
+    """加载股票列表（带缓存）"""
+    global _stock_list_cache
+    
+    if _stock_list_cache is not None:
+        return _stock_list_cache
+    
+    stock_list_file = './data/stocks/stock_list.csv'
+    if os.path.exists(stock_list_file):
+        try:
+            _stock_list_cache = pd.read_csv(stock_list_file, dtype={'code': str})
+            return _stock_list_cache
+        except Exception as e:
+            print(f"加载股票列表失败: {e}")
+            return None
+    return None
+
+
+def get_stock_name(stock_code: str) -> str:
+    """根据股票代码获取股票名称"""
+    stock_list = load_stock_list()
+    
+    if stock_list is None:
+        return stock_code
+    
+    # 确保stock_code是6位字符串
+    stock_code = str(stock_code).zfill(6)
+    
+    # 查找股票名称
+    match = stock_list[stock_list['code'] == stock_code]
+    if not match.empty and 'name' in match.columns:
+        name = match.iloc[0]['name']
+        # 如果name不为空且不等于code，返回name
+        if pd.notna(name) and str(name) != stock_code:
+            return str(name)
+    
+    return stock_code
+
 
 def analyze_volume_surge(csv_files: List[str], progress_callback=None) -> pd.DataFrame:
     """
@@ -115,10 +157,11 @@ def analyze_stock_flexible(file_path: str) -> Optional[List[Dict]]:
             
             if volume_ratio >= 5.0 and current['close'] > current['ma']:
                 stock_code = os.path.basename(file_path).replace('.csv', '')
+                stock_name = get_stock_name(stock_code)  # 从股票列表中获取真实名称
                 
                 results.append({
                     'stock_code': stock_code,
-                    'stock_name': stock_code,  # 暂时使用代码作为名称
+                    'stock_name': stock_name,
                     'date': current['date'].strftime('%Y-%m-%d'),
                     'close': current['close'],
                     'ma': current['ma'],

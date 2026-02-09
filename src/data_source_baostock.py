@@ -58,8 +58,10 @@ class BaoStockDataSource:
         try:
             self.logger.info("从BaoStock获取股票列表...")
             
-            # 获取所有A股股票
-            rs = bs.query_all_stock(day=datetime.now().strftime('%Y-%m-%d'))
+            # 获取所有A股股票，优先使用当天日期
+            query_date = datetime.now().strftime('%Y-%m-%d')
+            self.logger.info(f"查询日期: {query_date}")
+            rs = bs.query_all_stock(day=query_date)
             
             if rs.error_code != '0':
                 self.logger.error(f"获取股票列表失败: {rs.error_msg}")
@@ -75,14 +77,39 @@ class BaoStockDataSource:
             self.logger.info(f"从BaoStock获取到 {len(stock_list)} 条记录")
             self.logger.info(f"字段列表: {list(stock_list.columns)}")
             
-            # 检查是否为空
+            # 检查是否为空，可能是非交易日
             if len(stock_list) == 0:
-                self.logger.warning("BaoStock返回的股票列表为空")
-                return pd.DataFrame(columns=['code', 'name'])
+                self.logger.warning(f"查询日期 {query_date} 返回空数据，可能是非交易日")
+                
+                # 尝试查询最近的交易日（向前查询最多7天）
+                for days_back in range(1, 8):
+                    retry_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+                    # 跳过周末
+                    retry_datetime = datetime.now() - timedelta(days=days_back)
+                    if retry_datetime.weekday() >= 5:  # 周六或周日
+                        continue
+                    
+                    self.logger.info(f"尝试查询 {retry_date}...")
+                    rs_retry = bs.query_all_stock(day=retry_date)
+                    
+                    if rs_retry.error_code == '0':
+                        data_list_retry = []
+                        while rs_retry.next():
+                            data_list_retry.append(rs_retry.get_row_data())
+                        
+                        if len(data_list_retry) > 0:
+                            self.logger.info(f"成功从 {retry_date} 获取到 {len(data_list_retry)} 条记录")
+                            stock_list = pd.DataFrame(data_list_retry, columns=rs_retry.fields)
+                            break
+                
+                # 如果仍然为空，返回空DataFrame
+                if len(stock_list) == 0:
+                    self.logger.warning("未能从最近7个工作日获取到股票列表")
+                    return pd.DataFrame(columns=['code', 'name'])
             
             # 过滤只保留A股
             if 'code' in stock_list.columns:
-                stock_list = stock_list[stock_list['code'].str.contains(r'^(sh\.|sz\.)', regex=True)]
+                stock_list = stock_list[stock_list['code'].str.match(r'^(?:sh\.|sz\.)', na=False)]
             else:
                 self.logger.error(f"返回的数据中没有'code'字段，可用字段: {list(stock_list.columns)}")
                 return None

@@ -17,6 +17,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.utils import setup_logger, Config, is_trading_day
 from src.data_downloader import DataDownloader
 from src.stock_filter import StockFilter
+from src.notification import NotificationService
 
 
 class TaskScheduler:
@@ -40,6 +41,7 @@ class TaskScheduler:
         # 初始化组件
         self.downloader = DataDownloader(config_file)
         self.filter = StockFilter(config_file)
+        self.notifier = NotificationService(config_file)
         
         # 状态管理
         self.is_running = False
@@ -175,7 +177,19 @@ class TaskScheduler:
             self._notify_progress('筛选股票', stock_count, stock_count, 
                                 f'筛选完成: {matched_count} 只符合条件')
             
-            # 5. 完成
+            # 5. 发送微信推送
+            if matched_stocks:
+                try:
+                    analysis_date = datetime.now().strftime('%Y-%m-%d')
+                    push_success = self.notifier.send_analysis_result(matched_stocks, analysis_date)
+                    if push_success:
+                        self.logger.info("微信推送成功")
+                    else:
+                        self.logger.warning("微信推送失败或未启用")
+                except Exception as e:
+                    self.logger.error(f"微信推送异常: {e}")
+            
+            # 6. 完成
             if output_file:
                 message = f"任务完成！找到 {matched_count} 只符合条件的股票，结果已保存到 {output_file}"
             else:
