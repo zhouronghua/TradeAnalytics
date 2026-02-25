@@ -102,13 +102,16 @@ def analyze_volume_surge(csv_files: List[str], progress_callback=None) -> pd.Dat
     return results_df
 
 
-def analyze_stock_flexible(file_path: str) -> Optional[List[Dict]]:
+def analyze_stock_flexible(file_path: str, recent_days: int = 30) -> Optional[List[Dict]]:
     """
     灵活分析单只股票
-    规则：当天成交量 >= 前7天平均成交量的5倍，且收盘价 > 均线
+    规则：检查最近N天的数据，找出成交量 >= 前7天平均成交量5倍的日期，且收盘价 > 均线
+    
+    注意：BaoStock是T+1数据，当天的数据要第二天才能获取
     
     Args:
         file_path: CSV文件路径
+        recent_days: 检查最近N天的数据，默认30天
     
     Returns:
         符合条件的记录列表
@@ -123,6 +126,9 @@ def analyze_stock_flexible(file_path: str) -> Optional[List[Dict]]:
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date')
         
+        # 记录最新数据日期（用于调试）
+        latest_date = df['date'].max()
+        
         # 计算能计算的均线
         if len(df) >= 120:
             ma_period = 120
@@ -135,8 +141,8 @@ def analyze_stock_flexible(file_path: str) -> Optional[List[Dict]]:
         
         df['ma'] = df['close'].rolling(window=ma_period).mean()
         
-        # 获取最近的数据
-        recent_data = df.tail(min(10, len(df)))
+        # 获取最近N天的数据（扩大分析范围）
+        recent_data = df.tail(min(recent_days, len(df)))
         
         results = []
         
@@ -169,7 +175,8 @@ def analyze_stock_flexible(file_path: str) -> Optional[List[Dict]]:
                     'volume': current['volume'],
                     'avg_7day_volume': int(avg_7day_volume),
                     'volume_ratio': volume_ratio,
-                    'price_above_ma': ((current['close'] - current['ma']) / current['ma'] * 100)
+                    'price_above_ma': ((current['close'] - current['ma']) / current['ma'] * 100),
+                    'data_latest_date': latest_date.strftime('%Y-%m-%d')  # 添加最新数据日期
                 })
         
         return results

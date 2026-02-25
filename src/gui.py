@@ -805,7 +805,12 @@ class StockAnalyzerGUI:
             # 清空现有数据
             for item in self.result_tree.get_children():
                 self.result_tree.delete(item)
-            
+
+            # 获取最新数据日期（如果存在）
+            latest_data_date = None
+            if 'data_latest_date' in df.columns and not df.empty:
+                latest_data_date = df.iloc[0]['data_latest_date']
+
             # 插入新数据
             for _, row in df.iterrows():
                 # 确保股票代码是6位字符串格式
@@ -820,6 +825,13 @@ class StockAnalyzerGUI:
                     f"{row.get('avg_7day_volume', 0):,.0f}",
                     f"{row['volume_ratio']:.2f}"
                 ))
+            
+            # 更新状态栏，显示最新数据日期
+            if latest_data_date:
+                self.status_label.config(
+                    text=f"状态: 分析完成（最新数据: {latest_data_date}）", 
+                    foreground="green"
+                )
             
             # 更新统计
             self.matched_count_label.config(text=str(len(df)))
