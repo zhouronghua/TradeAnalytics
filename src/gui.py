@@ -26,6 +26,7 @@ from src.scheduler import TaskScheduler
 from src.data_downloader import DataDownloader
 from src.stock_filter import StockFilter
 from src.volume_analyzer import analyze_volume_surge
+from src.monster_stock_analyzer import MonsterStockAnalyzer
 
 
 class StockAnalyzerGUI:
@@ -127,17 +128,19 @@ class StockAnalyzerGUI:
                   command=self.run_analysis, width=15).grid(row=0, column=0, padx=5)
         ttk.Button(control_frame, text="成交量暴涨分析", 
                   command=self.run_volume_analysis, width=15).grid(row=0, column=1, padx=5)
+        ttk.Button(control_frame, text="妖股筛选", 
+                  command=self.run_monster_stock_analysis, width=15).grid(row=0, column=2, padx=5)
         ttk.Button(control_frame, text="查看历史结果", 
-                  command=self.view_history, width=15).grid(row=0, column=2, padx=5)
+                  command=self.view_history, width=15).grid(row=0, column=3, padx=5)
         ttk.Button(control_frame, text="导出结果", 
-                  command=self.export_results, width=15).grid(row=0, column=3, padx=5)
+                  command=self.export_results, width=15).grid(row=0, column=4, padx=5)
         ttk.Button(control_frame, text="设置", 
-                  command=self.open_settings, width=15).grid(row=0, column=4, padx=5)
+                  command=self.open_settings, width=15).grid(row=0, column=5, padx=5)
         
         # 状态指示器
         self.status_label = ttk.Label(control_frame, text="状态: 空闲", 
                                       foreground="green")
-        self.status_label.grid(row=0, column=5, padx=20)
+        self.status_label.grid(row=0, column=6, padx=20)
         
         # 进度条
         self.progress_var = tk.DoubleVar()
@@ -145,11 +148,11 @@ class StockAnalyzerGUI:
                                            variable=self.progress_var, 
                                            mode='determinate',
                                            maximum=100)
-        self.progress_bar.grid(row=0, column=6, padx=10)
+        self.progress_bar.grid(row=0, column=7, padx=10)
         
         # 进度文本
         self.progress_label = ttk.Label(control_frame, text="")
-        self.progress_label.grid(row=0, column=7, padx=5)
+        self.progress_label.grid(row=0, column=8, padx=5)
     
     def create_overview_panel(self, parent):
         """创建数据概览面板"""
@@ -351,7 +354,7 @@ class StockAnalyzerGUI:
         """打开设置对话框"""
         dialog = tk.Toplevel(self.root)
         dialog.title("设置")
-        dialog.geometry("500x400")
+        dialog.geometry("500x550")
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -389,14 +392,30 @@ class StockAnalyzerGUI:
             value=self.config.getfloat('Analysis', 'volume_ratio_threshold', fallback=5.0))
         ttk.Entry(frame, textvariable=volume_ratio_var, width=20).grid(row=5, column=1, sticky=tk.W)
         
+        # 妖股筛选设置
+        ttk.Label(frame, text="妖股筛选参数", font=('', 12, 'bold')).grid(
+            row=6, column=0, columnspan=2, sticky=tk.W, pady=(20, 10))
+
+        ttk.Label(frame, text="回看天数:").grid(row=7, column=0, sticky=tk.W, pady=5)
+        lookback_var = tk.IntVar(value=self.config.getint('MonsterStock', 'lookback_days', fallback=30))
+        ttk.Entry(frame, textvariable=lookback_var, width=20).grid(row=7, column=1, sticky=tk.W)
+
+        ttk.Label(frame, text="最低综合评分:").grid(row=8, column=0, sticky=tk.W, pady=5)
+        min_score_var = tk.IntVar(value=self.config.getint('MonsterStock', 'min_score', fallback=30))
+        ttk.Entry(frame, textvariable=min_score_var, width=20).grid(row=8, column=1, sticky=tk.W)
+
+        ttk.Label(frame, text="量能暴增倍数:").grid(row=9, column=0, sticky=tk.W, pady=5)
+        surge_ratio_var = tk.DoubleVar(value=self.config.getfloat('MonsterStock', 'volume_surge_ratio', fallback=3.0))
+        ttk.Entry(frame, textvariable=surge_ratio_var, width=20).grid(row=9, column=1, sticky=tk.W)
+
         # 下载设置
         ttk.Label(frame, text="下载设置", font=('', 12, 'bold')).grid(
-            row=6, column=0, columnspan=2, sticky=tk.W, pady=(20, 10))
+            row=10, column=0, columnspan=2, sticky=tk.W, pady=(20, 10))
         
         # 并发数
-        ttk.Label(frame, text="下载并发数:").grid(row=7, column=0, sticky=tk.W, pady=5)
+        ttk.Label(frame, text="下载并发数:").grid(row=11, column=0, sticky=tk.W, pady=5)
         max_workers_var = tk.IntVar(value=self.config.getint('Download', 'max_workers', fallback=10))
-        ttk.Entry(frame, textvariable=max_workers_var, width=20).grid(row=7, column=1, sticky=tk.W)
+        ttk.Entry(frame, textvariable=max_workers_var, width=20).grid(row=11, column=1, sticky=tk.W)
         
         # 保存按钮
         def save_settings():
@@ -408,6 +427,12 @@ class StockAnalyzerGUI:
                 self.config.config.set('Analysis', 'volume_ratio_threshold', 
                                       str(volume_ratio_var.get()))
                 self.config.config.set('Download', 'max_workers', str(max_workers_var.get()))
+
+                if not self.config.config.has_section('MonsterStock'):
+                    self.config.config.add_section('MonsterStock')
+                self.config.config.set('MonsterStock', 'lookback_days', str(lookback_var.get()))
+                self.config.config.set('MonsterStock', 'min_score', str(min_score_var.get()))
+                self.config.config.set('MonsterStock', 'volume_surge_ratio', str(surge_ratio_var.get()))
                 
                 # 保存到文件
                 with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -419,7 +444,7 @@ class StockAnalyzerGUI:
                 messagebox.showerror("错误", f"保存设置失败: {e}")
         
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=8, column=0, columnspan=2, pady=20)
+        btn_frame.grid(row=12, column=0, columnspan=2, pady=20)
         ttk.Button(btn_frame, text="保存", command=save_settings, width=15).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="取消", command=dialog.destroy, width=15).pack(side=tk.LEFT, padx=5)
     
@@ -1240,6 +1265,123 @@ class StockAnalyzerGUI:
         except Exception as e:
             messagebox.showerror("错误", f"保存图表失败: {e}")
     
+    def run_monster_stock_analysis(self):
+        """执行妖股筛选分析"""
+        if self.is_running:
+            messagebox.showwarning("提示", "任务正在运行中，请稍候...")
+            return
+
+        if not messagebox.askyesno("确认",
+                "执行妖股综合筛选？\n"
+                "综合评分维度:\n"
+                "  - 量能异动(放量倍数)\n"
+                "  - 涨停板分析(连板/涨停次数)\n"
+                "  - 价格形态(突破/均线多头)\n"
+                "  - 技术指标(MACD/RSI)\n"
+                "  - 换手率分析"):
+            return
+
+        self.log("开始妖股综合筛选...")
+        self.status_label.config(text="状态: 妖股筛选中", foreground="orange")
+        self.is_running = True
+
+        def monster_thread():
+            try:
+                analyzer = MonsterStockAnalyzer(self.config)
+                daily_dir = self.config.get('Paths', 'daily_dir', fallback='./data/daily')
+                results_dir = self.config.get('Paths', 'results_dir', fallback='./data/results')
+
+                csv_files = glob.glob(os.path.join(daily_dir, '*.csv'))
+                if not csv_files:
+                    self.log("错误: 没有找到股票数据文件")
+                    self.root.after(0, lambda: messagebox.showerror("错误", "没有找到股票数据"))
+                    return
+
+                self.log(f"找到 {len(csv_files)} 个数据文件, 开始多维度分析...")
+
+                def progress_wrapper(current, total, message):
+                    self.on_task_progress("妖股筛选", current, total, message)
+
+                results_df, output_file = analyzer.run(daily_dir, results_dir, progress_wrapper)
+
+                if results_df.empty:
+                    self.log("未发现符合条件的妖股候选")
+                    self.root.after(0, lambda: messagebox.showinfo("结果", "未发现符合条件的妖股候选"))
+                    return
+
+                self.log(f"发现 {len(results_df)} 只妖股候选")
+                self.root.after(0, lambda: self.load_monster_results(results_df))
+
+                if output_file:
+                    self.log(f"结果已保存: {output_file}")
+                    self.current_result_file = output_file
+
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "完成", f"妖股筛选完成!\n发现 {len(results_df)} 只候选股\n"
+                            f"按综合评分排序"))
+
+            except Exception as e:
+                self.log(f"妖股筛选失败: {e}")
+                self.root.after(0, lambda: messagebox.showerror("错误", f"分析失败: {e}"))
+
+            finally:
+                self.is_running = False
+                self.root.after(0, lambda: self.status_label.config(
+                    text="状态: 空闲", foreground="green"))
+                self.root.after(0, lambda: self.progress_var.set(0))
+                self.root.after(0, lambda: self.progress_label.config(text=""))
+
+        threading.Thread(target=monster_thread, daemon=True).start()
+
+    def load_monster_results(self, df: pd.DataFrame):
+        """加载妖股筛选结果到表格"""
+        try:
+            for item in self.result_tree.get_children():
+                self.result_tree.delete(item)
+
+            # 重新配置表格列以适应妖股数据
+            columns = ('股票代码', '股票名称', '日期', '收盘价', '涨跌幅(%)',
+                      '量比', 'RSI', '综合评分', '量能分', '涨停分',
+                      '形态分', '技术分', '连板数')
+
+            self.result_tree.config(columns=columns)
+            for col in columns:
+                self.result_tree.heading(col, text=col,
+                                        command=lambda c=col: self.sort_treeview(c))
+                if col in ['股票代码', '股票名称']:
+                    self.result_tree.column(col, width=90, anchor=tk.CENTER)
+                elif col == '日期':
+                    self.result_tree.column(col, width=90, anchor=tk.CENTER)
+                elif col == '综合评分':
+                    self.result_tree.column(col, width=80, anchor=tk.CENTER)
+                else:
+                    self.result_tree.column(col, width=70, anchor=tk.E)
+
+            for _, row in df.iterrows():
+                stock_code = str(row['stock_code']).zfill(6)
+                self.result_tree.insert('', tk.END, values=(
+                    stock_code,
+                    row.get('stock_name', stock_code),
+                    row.get('date', ''),
+                    f"{row.get('close', 0):.2f}",
+                    f"{row.get('change_pct', 0):.2f}",
+                    f"{row.get('volume_ratio', 0):.1f}",
+                    f"{row.get('rsi', 0):.1f}",
+                    f"{row.get('total_score', 0)}",
+                    f"{row.get('volume_score', 0)}",
+                    f"{row.get('limit_score', 0)}",
+                    f"{row.get('price_score', 0)}",
+                    f"{row.get('tech_score', 0)}",
+                    f"{row.get('consecutive_limits', 0)}",
+                ))
+
+            self.matched_count_label.config(text=str(len(df)))
+            self.log(f"已加载 {len(df)} 只妖股候选 (按综合评分排序)")
+
+        except Exception as e:
+            self.log(f"加载妖股结果失败: {e}")
+            messagebox.showerror("错误", f"加载结果失败: {e}")
+
     def on_closing(self):
         """窗口关闭事件"""
         if self.is_running:

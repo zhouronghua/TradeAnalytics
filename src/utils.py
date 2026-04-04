@@ -12,31 +12,90 @@ import pandas as pd
 
 
 class Config:
-    """配置管理类"""
-    
+    """配置管理类
+
+    加载优先级 (后者覆盖前者):
+      1. config/config.ini.example  -- 仓库模板，提供默认值
+      2. config/config.ini          -- 用户本地配置 (gitignored)
+      3. config/config.local.ini    -- 可选本地覆盖 (gitignored)
+      4. 环境变量 TA_<SECTION>_<KEY> -- 最高优先级
+
+    首次运行时若 config.ini 不存在，自动从 .example 拷贝。
+    """
+
+    # 支持环境变量覆盖的敏感字段: (section, key) -> 环境变量名
+    _ENV_MAP = {
+        ('Email', 'sender_email'):    'TA_EMAIL_SENDER',
+        ('Email', 'auth_code'):       'TA_EMAIL_AUTH',
+        ('Email', 'receiver_emails'): 'TA_EMAIL_RECEIVER',
+        ('Notification', 'serverchan_key'):    'TA_SERVERCHAN_KEY',
+        ('Notification', 'qywechat_webhook'):  'TA_QYWECHAT_WEBHOOK',
+        ('Notification', 'pushplus_token'):    'TA_PUSHPLUS_TOKEN',
+        ('Notification', 'wechat_appid'):      'TA_WECHAT_APPID',
+        ('Notification', 'wechat_secret'):     'TA_WECHAT_SECRET',
+    }
+
     def __init__(self, config_file: str = 'config/config.ini'):
         self.config = configparser.ConfigParser()
         self.config_file = config_file
-        
-        if os.path.exists(config_file):
-            self.config.read(config_file, encoding='utf-8')
-        else:
-            raise FileNotFoundError(f"配置文件不存在: {config_file}")
-    
+
+        example_file = config_file + '.example'
+        local_file = config_file.replace('.ini', '.local.ini')
+
+        # 如果 config.ini 不存在但 .example 存在，自动拷贝
+        if not os.path.exists(config_file) and os.path.exists(example_file):
+            import shutil
+            shutil.copy2(example_file, config_file)
+            logging.info(f"首次运行: 已从 {example_file} 创建 {config_file}，请编辑填入实际配置")
+
+        # 按优先级依次读取 (后读取的覆盖先读取的)
+        read_files = []
+        for f in [example_file, config_file, local_file]:
+            if os.path.exists(f):
+                read_files.append(f)
+
+        if not read_files:
+            raise FileNotFoundError(
+                f"配置文件不存在: {config_file}\n"
+                f"请从 {example_file} 复制一份并填入实际配置")
+
+        self.config.read(read_files, encoding='utf-8')
+
+    def _env_override(self, section: str, key: str, value):
+        """检查环境变量覆盖"""
+        env_name = self._ENV_MAP.get((section, key))
+        if env_name:
+            env_val = os.environ.get(env_name)
+            if env_val is not None:
+                return env_val
+        return value
+
     def get(self, section: str, key: str, fallback=None):
-        """获取配置项"""
-        return self.config.get(section, key, fallback=fallback)
-    
+        val = self.config.get(section, key, fallback=fallback)
+        return self._env_override(section, key, val)
+
     def getint(self, section: str, key: str, fallback=None):
-        """获取整数配置项"""
+        val = self._env_override(section, key, None)
+        if val is not None and not isinstance(val, int):
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                pass
         return self.config.getint(section, key, fallback=fallback)
-    
+
     def getfloat(self, section: str, key: str, fallback=None):
-        """获取浮点数配置项"""
+        val = self._env_override(section, key, None)
+        if val is not None and not isinstance(val, float):
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                pass
         return self.config.getfloat(section, key, fallback=fallback)
-    
+
     def getboolean(self, section: str, key: str, fallback=None):
-        """获取布尔配置项"""
+        val = self._env_override(section, key, None)
+        if val is not None:
+            return val.lower() in ('true', '1', 'yes', 'on')
         return self.config.getboolean(section, key, fallback=fallback)
 
 

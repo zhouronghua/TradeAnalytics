@@ -32,6 +32,10 @@ ENV/
 *.swo
 *~
 
+# 配置文件(含敏感信息，只提交 .example 模板)
+config/config.ini
+config/config.local.ini
+
 # 项目特定
 data/daily/*.csv
 data/stocks/*.csv
