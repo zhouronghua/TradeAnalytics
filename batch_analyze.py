@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 TradeAnalytics 批量分析CLI入口
 
 用法:
-    python3 batch_analyze.py                    # 完整流程: 更新数据 + 妖股筛选 + 邮件
-    python3 batch_analyze.py --skip-download    # 跳过数据下载，直接分析
-    python3 batch_analyze.py --no-email         # 不发送邮件
-    python3 batch_analyze.py --test-email       # 仅发送测试邮件
-    python3 batch_analyze.py --volume-only      # 仅成交量暴涨分析
+    python batch_analyze.py                    # 完整流程: 更新数据 + 妖股筛选 + Server酱推送
+    python batch_analyze.py --skip-download    # 跳过数据下载，直接分析
+    python batch_analyze.py --no-push          # 分析完成后不推送
+    python batch_analyze.py --test-push        # 仅发送 Server酱 测试消息
+    python batch_analyze.py --volume-only      # 仅成交量暴涨分析
 """
 
 import argparse
@@ -16,23 +17,33 @@ import os
 import glob
 from datetime import datetime
 
+if sys.version_info[0] < 3:
+    sys.stderr.write(
+        "请使用 Python 3 运行，例如: python3 batch_analyze.py 或 py -3 batch_analyze.py\n"
+    )
+    sys.exit(1)
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.utils import setup_logger, Config, is_trading_day
 from src.data_downloader import DataDownloader
 from src.monster_stock_analyzer import MonsterStockAnalyzer
 from src.volume_analyzer import analyze_volume_surge
-from src.email_sender import EmailSender
+from src.notification import NotificationService
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='TradeAnalytics 批量分析')
     parser.add_argument('--skip-download', action='store_true',
                         help='跳过数据下载，使用本地已有数据')
+    parser.add_argument('--no-push', action='store_true',
+                        help='分析完成后不推送 Server酱')
     parser.add_argument('--no-email', action='store_true',
-                        help='不发送邮件')
+                        help='已弃用，等同于 --no-push')
+    parser.add_argument('--test-push', action='store_true',
+                        help='仅发送 Server酱 测试消息')
     parser.add_argument('--test-email', action='store_true',
-                        help='仅发送测试邮件')
+                        help='已弃用，等同于 --test-push')
     parser.add_argument('--volume-only', action='store_true',
                         help='仅执行成交量暴涨分析(原有逻辑)')
     parser.add_argument('--force-non-trading', action='store_true',
@@ -128,14 +139,13 @@ def main():
 
     logger = setup_logger('BatchAnalyze')
 
-    # 测试邮件模式
-    if args.test_email:
-        logger.info("发送测试邮件...")
-        sender = EmailSender(args.config)
-        if sender.send_test():
-            print("[OK] 测试邮件发送成功")
+    if args.test_push or args.test_email:
+        logger.info("发送 Server酱 测试消息...")
+        notifier = NotificationService(args.config)
+        if notifier.send_serverchan_test():
+            print("[OK] Server酱 测试消息已发送")
         else:
-            print("[FAIL] 测试邮件发送失败，请检查config.ini中[Email]配置")
+            print("[FAIL] 发送失败，请检查 config.ini 中 [Notification] serverchan_key")
         return
 
     # 交易日检查
@@ -180,18 +190,38 @@ def main():
     else:
         print("\n未发现符合条件的候选股")
 
-    # 步骤4: 发送邮件
-    if not args.no_email:
-        logger.info("--- 发送邮件 ---")
-        sender = EmailSender(args.config)
-        if sender.enabled:
-            today = datetime.now().strftime('%Y-%m-%d')
-            if sender.send_monster_stock_report(results_df, today):
-                print("[OK] 分析报告邮件已发送")
+    # 步骤4: Server酱 推送（妖股综合筛选；成交量模式不推送结构化妖股报告）
+    skip_push = args.no_push or args.no_email
+    if not skip_push:
+        today = datetime.now().strftime('%Y-%m-%d')
+        notifier = NotificationService(args.config)
+        if args.volume_only:
+            logger.info("--- Server酱 推送(成交量分析) ---")
+            if results_df is not None and not results_df.empty:
+                title = f"[量暴] {today} {len(results_df)} 只"
+                preview = results_df.head(
+                    notifier.config.getint('Notification', 'push_max_stocks', fallback=20)
+                ).to_string(index=False)
+                body = (
+                    f"分析日期: {today}\n"
+                    f"结果文件: {output_file or '(未写入路径)'}\n\n"
+                    f"{preview}"
+                )
+                ok = notifier.send_serverchan_fallback(title, body)
             else:
-                print("[FAIL] 邮件发送失败")
+                title = f"[量暴] {today} 无标的"
+                body = "本次成交量暴涨分析未发现符合条件的股票。"
+                ok = notifier.send_serverchan_fallback(title, body)
+            if ok:
+                print("[OK] 成交量分析结果已通过 Server酱 发送")
+            else:
+                print("[FAIL] Server酱 发送失败，请检查 serverchan_key")
         else:
-            logger.info("邮件功能未启用(config.ini [Email] enabled=false)")
+            logger.info("--- Server酱 推送 ---")
+            if notifier.send_monster_stock_report_serverchan(results_df, today):
+                print("[OK] 分析报告已通过 Server酱 发送")
+            else:
+                print("[FAIL] Server酱 发送失败，请检查 serverchan_key")
 
     print("\n分析完成.")
 

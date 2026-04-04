@@ -23,6 +23,7 @@ class EmailSender:
 
     def __init__(self, config_file: str = 'config/config.ini'):
         self.logger = setup_logger('EmailSender')
+        self.config_file = config_file
         self.config = Config(config_file)
 
         section = 'Email'
@@ -54,7 +55,11 @@ class EmailSender:
         subject = f"[妖股筛选] {analysis_date} 发现 {len(results_df)} 只候选股"
         html_body = self._build_monster_stock_html(results_df, analysis_date)
 
-        return self._send_email(subject, html_body)
+        if self._send_email(subject, html_body):
+            return True
+        self.logger.warning("邮件发送失败，尝试通过 Server 酱推送")
+        md = self._monster_df_to_markdown(results_df, analysis_date)
+        return self._notify_serverchan_fallback(subject, md)
 
     def _send_empty_report(self, analysis_date: str = None) -> bool:
         if analysis_date is None:
@@ -70,7 +75,14 @@ class EmailSender:
         </p>
         </body></html>
         """
-        return self._send_email(subject, html)
+        if self._send_email(subject, html):
+            return True
+        self.logger.warning("邮件发送失败，尝试通过 Server 酱推送")
+        text = (
+            f"分析日期: {analysis_date}\n\n"
+            "本次分析未发现符合条件的妖股候选。"
+        )
+        return self._notify_serverchan_fallback(subject, text)
 
     def _build_monster_stock_html(self, df: pd.DataFrame, date: str) -> str:
         """构建妖股报告HTML邮件"""
@@ -168,6 +180,48 @@ class EmailSender:
         </body></html>
         """
         return html
+
+    def _monster_df_to_markdown(self, df: pd.DataFrame, date: str) -> str:
+        """妖股结果转为 Server 酱可用的纯文本/Markdown 摘要"""
+        max_rows = self.config.getint('Notification', 'push_max_stocks', fallback=20)
+        lines = [
+            f"分析日期: {date}",
+            f"候选数量: {len(df)}",
+            "",
+        ]
+        _g = self._get_field
+        for i, (_, row) in enumerate(df.iterrows()):
+            if i >= max_rows:
+                lines.append(f"... 其余 {len(df) - max_rows} 只略，详见本地结果 CSV")
+                break
+            code = str(_g(row, 'stock_code', '股票代码', '')).zfill(6)
+            name = _g(row, 'stock_name', '股票名称', code)
+            score = int(_g(row, 'total_score', '综合评分'))
+            close = float(_g(row, 'close', '收盘价'))
+            chg = float(_g(row, 'change_pct', '涨跌幅(%)'))
+            reasons = self._generate_reasons(row)
+            reason_text = "; ".join(reasons) if reasons else "-"
+            lines.append(
+                f"- {code} {name} 收盘{close:.2f} {chg:+.2f}% 综合分{score} | {reason_text}"
+            )
+        lines.append("")
+        lines.append(
+            f"发送时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | TradeAnalytics"
+        )
+        return "\n".join(lines)
+
+    def _notify_serverchan_fallback(self, title: str, content: str) -> bool:
+        try:
+            from src.notification import NotificationService
+
+            notifier = NotificationService(self.config_file)
+            ok = notifier.send_serverchan_fallback(title, content)
+            if ok:
+                self.logger.info("已通过 Server 酱发送（邮件未成功）")
+            return ok
+        except Exception as e:
+            self.logger.error(f"Server 酱回退发送异常: {e}")
+            return False
 
     @staticmethod
     def _get_field(row, en_name: str, cn_name: str, default=0):
@@ -279,4 +333,11 @@ class EmailSender:
         </p>
         </body></html>
         """
-        return self._send_email(subject, html)
+        if self._send_email(subject, html):
+            return True
+        self.logger.warning("邮件发送失败，尝试通过 Server 酱推送")
+        body = (
+            "本应为 TradeAnalytics 邮件测试，邮件通道未成功，改由 Server 酱送达。\n"
+            "请检查 SMTP、授权码与收件人配置。"
+        )
+        return self._notify_serverchan_fallback(subject + " [Server酱]", body)

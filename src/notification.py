@@ -495,6 +495,48 @@ class NotificationService:
         
         return template_data
     
+    def send_serverchan_fallback(self, title: str, content: str) -> bool:
+        """
+        邮件等主通道失败时的 Server 酱补发。
+        不检查 Notification.enabled，仅要求已配置 serverchan_key。
+        """
+        if not self.serverchan_key:
+            self.logger.warning("Server酱SendKey未配置，跳过邮件失败回退推送")
+            return False
+        return self._send_serverchan(title, content)
+
+    def send_serverchan_test(self) -> bool:
+        """Server酱连通性测试（不依赖 Notification.enabled）。"""
+        title = "TradeAnalytics Server酱测试"
+        content = (
+            f"发送时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            "若收到本消息，说明 Server酱（sctapi）配置正确。"
+        )
+        return self.send_serverchan_fallback(title, content)
+
+    def send_monster_stock_report_serverchan(
+        self, results_df: Optional[pd.DataFrame], analysis_date: Optional[str] = None
+    ) -> bool:
+        """
+        妖股筛选结果仅通过 Server 酱推送。
+        不检查 Notification.enabled；正文格式与邮件摘要一致（复用 EmailSender 生成逻辑）。
+        """
+        if analysis_date is None:
+            analysis_date = datetime.now().strftime('%Y-%m-%d')
+        from src.email_sender import EmailSender
+
+        helper = EmailSender(self.config_file)
+        if results_df is None or results_df.empty:
+            title = f"[妖股筛选] {analysis_date} 未发现候选股"
+            body = (
+                f"分析日期: {analysis_date}\n\n"
+                "本次分析未发现符合条件的妖股候选。"
+            )
+        else:
+            title = f"[妖股筛选] {analysis_date} 发现 {len(results_df)} 只候选股"
+            body = helper._monster_df_to_markdown(results_df, analysis_date)
+        return self.send_serverchan_fallback(title, body)
+
     def _send_serverchan(self, title: str, content: str) -> bool:
         """
         通过Server酱发送消息
