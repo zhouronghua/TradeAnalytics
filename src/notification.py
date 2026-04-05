@@ -27,6 +27,7 @@ class NotificationService:
         Args:
             config_file: 配置文件路径
         """
+        self.config_file = config_file
         self.config = Config(config_file)
         self.logger = setup_logger('Notification')
         

@@ -30,6 +30,7 @@ from src.data_downloader import DataDownloader
 from src.monster_stock_analyzer import MonsterStockAnalyzer
 from src.volume_analyzer import analyze_volume_surge
 from src.notification import NotificationService
+from src.email_sender import EmailSender
 
 
 def parse_args():
@@ -190,11 +191,13 @@ def main():
     else:
         print("\n未发现符合条件的候选股")
 
-    # 步骤4: Server酱 推送（妖股综合筛选；成交量模式不推送结构化妖股报告）
+    # 步骤4: 推送（邮件 + Server酱同时尝试，互不影响）
     skip_push = args.no_push or args.no_email
     if not skip_push:
         today = datetime.now().strftime('%Y-%m-%d')
+        email_sender = EmailSender(args.config)
         notifier = NotificationService(args.config)
+        
         if args.volume_only:
             logger.info("--- Server酱 推送(成交量分析) ---")
             if results_df is not None and not results_df.empty:
@@ -217,11 +220,28 @@ def main():
             else:
                 print("[FAIL] Server酱 发送失败，请检查 serverchan_key")
         else:
-            logger.info("--- Server酱 推送 ---")
-            if notifier.send_monster_stock_report_serverchan(results_df, today):
-                print("[OK] 分析报告已通过 Server酱 发送")
-            else:
-                print("[FAIL] Server酱 发送失败，请检查 serverchan_key")
+            logger.info("--- 妖股筛选推送(邮件+Server酱) ---")
+            # 尝试邮件推送（失败不阻塞Server酱）
+            email_ok = False
+            try:
+                email_ok = email_sender.send_monster_stock_report(results_df, today)
+                if email_ok:
+                    print("[OK] 分析报告已通过邮件发送")
+            except Exception as e:
+                logger.warning(f"邮件推送失败(忽略): {e}")
+            
+            # 尝试Server酱推送（失败不阻塞邮件）
+            serverchan_ok = False
+            try:
+                serverchan_ok = notifier.send_monster_stock_report_serverchan(results_df, today)
+                if serverchan_ok:
+                    print("[OK] 分析报告已通过 Server酱 发送")
+            except Exception as e:
+                logger.warning(f"Server酱推送失败(忽略): {e}")
+            
+            # 汇总结果
+            if not email_ok and not serverchan_ok:
+                print("[FAIL] 邮件和 Server酱 都发送失败")
 
     print("\n分析完成.")
 
