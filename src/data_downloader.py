@@ -29,6 +29,12 @@ try:
 except ImportError:
     BAOSTOCK_AVAILABLE = False
 
+try:
+    from src.data_source_tushare import TushareDataSource
+    TUSHARE_AVAILABLE = True
+except ImportError:
+    TUSHARE_AVAILABLE = False
+
 
 class DataDownloader:
     """数据下载器"""
@@ -64,7 +70,23 @@ class DataDownloader:
         # 初始化数据源
         self.data_source = self.config.get('DataSource', 'source', fallback='akshare').lower()
         self.baostock_source = None
-        
+        self.tushare_source = None
+
+        if self.data_source == 'tushare':
+            if not TUSHARE_AVAILABLE:
+                self.logger.error("Tushare不可用，请安装: pip install tushare")
+                self.logger.info("自动切换到AkShare")
+                self.data_source = 'akshare'
+            else:
+                try:
+                    tushare_token = self.config.get('DataSource', 'tushare_token', fallback=None)
+                    self.tushare_source = TushareDataSource(token=tushare_token)
+                    self.logger.info("使用Tushare Pro数据源")
+                except Exception as e:
+                    self.logger.error(f"Tushare初始化失败: {e}")
+                    self.logger.info("自动切换到AkShare")
+                    self.data_source = 'akshare'
+
         if self.data_source == 'baostock':
             if not BAOSTOCK_AVAILABLE:
                 self.logger.error("BaoStock不可用，请安装: pip install baostock")
@@ -73,17 +95,26 @@ class DataDownloader:
             else:
                 self.baostock_source = BaoStockDataSource()
                 self.logger.info("使用BaoStock数据源（线程安全版本）")
-        elif self.data_source == 'akshare':
+
+        if self.data_source == 'akshare':
             if not AKSHARE_AVAILABLE:
                 self.logger.error("AkShare不可用，请安装: pip install akshare")
                 if BAOSTOCK_AVAILABLE:
                     self.logger.info("自动切换到BaoStock")
                     self.data_source = 'baostock'
                     self.baostock_source = BaoStockDataSource()
+                elif TUSHARE_AVAILABLE:
+                    self.logger.info("自动切换到Tushare")
+                    self.data_source = 'tushare'
+                    try:
+                        tushare_token = self.config.get('DataSource', 'tushare_token', fallback=None)
+                        self.tushare_source = TushareDataSource(token=tushare_token)
+                    except Exception as e:
+                        self.logger.error(f"Tushare初始化失败: {e}")
             else:
                 self.logger.info("使用AkShare数据源")
-        
-        self.logger.info(f"数据下载器初始化完成（每日下载限制: {self.daily_download_limit_mb}MB）")
+
+        self.logger.info(f"数据下载器初始化完成（数据源: {self.data_source}, 每日下载限制: {self.daily_download_limit_mb}MB）")
     
     def download_stock_list(self, force_update: bool = False) -> Optional[pd.DataFrame]:
         """
@@ -110,16 +141,20 @@ class DataDownloader:
         self.logger.info(f"开始下载股票列表（数据源: {self.data_source}）...")
         
         stock_list = None
-        
+
         try:
-            if self.data_source == 'baostock' and self.baostock_source:
+            if self.data_source == 'tushare' and self.tushare_source:
+                # 使用Tushare Pro
+                stock_list = self.tushare_source.get_stock_list()
+
+            elif self.data_source == 'baostock' and self.baostock_source:
                 # 使用BaoStock（线程安全版本会自动处理登录）
                 stock_list = self.baostock_source.get_stock_list()
-                
+
             elif self.data_source == 'akshare':
                 # 使用AkShare
                 stock_list = ak.stock_zh_a_spot_em()
-                
+
                 if stock_list is not None and not stock_list.empty:
                     # 选择需要的列并重命名
                     columns_map = {
@@ -131,7 +166,7 @@ class DataDownloader:
                         '成交额': 'amount',
                         '总市值': 'total_value'
                     }
-                    
+
                     # 只保留存在的列
                     available_columns = {k: v for k, v in columns_map.items() if k in stock_list.columns}
                     stock_list = stock_list[list(available_columns.keys())].copy()
@@ -211,32 +246,50 @@ class DataDownloader:
             start_date = (datetime.now() - timedelta(days=self.min_history_days)).strftime('%Y%m%d')
         
         # 格式化日期
-        start_date_fmt = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
-        end_date_fmt = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
-        
+        # Tushare和BaoStock使用 YYYY-MM-DD 格式
+        start_date_fmt_std = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}"
+        end_date_fmt_std = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}"
+        # AkShare使用 YYYYMMDD 格式
+        start_date_fmt_ak = start_date
+        end_date_fmt_ak = end_date
+
         # 重试机制
         for attempt in range(self.retry_times):
             try:
                 df = None
-                
-                if self.data_source == 'baostock' and self.baostock_source:
+
+                if self.data_source == 'tushare' and self.tushare_source:
+                    # 使用Tushare Pro
+                    df = self.tushare_source.get_stock_history(
+                        stock_code=stock_code,
+                        start_date=start_date_fmt_std,
+                        end_date=end_date_fmt_std,
+                        adjust=adjust
+                    )
+
+                elif self.data_source == 'baostock' and self.baostock_source:
                     # 使用BaoStock（线程安全版本会自动处理登录）
                     df = self.baostock_source.get_stock_history(
                         stock_code=stock_code,
-                        start_date=start_date_fmt,
-                        end_date=end_date_fmt
+                        start_date=start_date_fmt_std,
+                        end_date=end_date_fmt_std
                     )
-                    
+
                 elif self.data_source == 'akshare':
-                    # 使用AkShare下载数据
-                    df = ak.stock_zh_a_hist(
-                        symbol=stock_code,
-                        period=period,
-                        start_date=start_date_fmt,
-                        end_date=end_date_fmt,
-                        adjust=adjust
-                    )
-                    
+                    # 使用AkShare下载数据 - 使用YYYYMMDD格式
+                    self.logger.debug(f"AkShare请求: {stock_code}, 日期: {start_date_fmt_ak} - {end_date_fmt_ak}")
+                    try:
+                        df = ak.stock_zh_a_hist(
+                            symbol=stock_code,
+                            period=period,
+                            start_date=start_date_fmt_ak,
+                            end_date=end_date_fmt_ak,
+                            adjust=adjust
+                        )
+                    except Exception as ak_err:
+                        self.logger.debug(f"AkShare异常 {stock_code}: {ak_err}")
+                        df = None
+
                     if df is not None and not df.empty:
                         # 标准化列名
                         columns_map = {
@@ -252,17 +305,20 @@ class DataDownloader:
                             '涨跌额': 'change',
                             '换手率': 'turnover'
                         }
-                        
+
                         # 只保留存在的列
                         available_columns = {k: v for k, v in columns_map.items() if k in df.columns}
                         df = df[list(available_columns.keys())].copy()
                         df.rename(columns=available_columns, inplace=True)
-                        
+
                         # 转换日期格式
                         df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
-                
+                    else:
+                        self.logger.debug(f"AkShare返回空数据 {stock_code}: df={df is None}")
+
                 if df is None or df.empty:
-                    self.logger.warning(f"股票 {stock_code} 数据为空")
+                    if attempt == self.retry_times - 1:  # 只在最后一次重试时输出警告
+                        self.logger.debug(f"股票 {stock_code} 数据为空 (已重试{self.retry_times}次)")
                     return None
                 
                 # 统计下载数据量（在成功下载后）

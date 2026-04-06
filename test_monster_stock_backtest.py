@@ -44,7 +44,7 @@ class MonsterStockBacktest:
                  start_date: str = '2020-01-01',
                  end_date: str = None,
                  lookback_days: int = 20,
-                 min_score: int = 30,
+                 min_score: int = 15,  # 降低默认阈值，让更多信号通过
                  hold_days_list: List[int] = None,
                  max_delay_days: int = 3):
         """
@@ -504,26 +504,42 @@ class MonsterStockBacktest:
 
 def main():
     """主函数"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='妖股策略完整回测')
+    parser.add_argument('--start', default='2020-01-01', help='回测开始日期 (默认: 2020-01-01)')
+    parser.add_argument('--end', default=None, help='回测结束日期 (默认: 今天)')
+    parser.add_argument('--min-score', type=int, default=15, help='妖股评分阈值 0-100 (默认: 15, 越低信号越多)')
+    parser.add_argument('--lookback', type=int, default=20, help='回看天数 (默认: 20)')
+    parser.add_argument('--hold-days', type=int, nargs='+', default=[5, 10, 20], help='持有期天数 (默认: 5 10 20)')
+    parser.add_argument('--data-dir', default='./data/daily', help='数据目录')
+    args = parser.parse_args()
+
     print("=" * 80)
     print("妖股策略完整回测")
     print("=" * 80)
     print("\n【策略说明】")
     print("- 选股: 妖股评分系统 (量能+涨停+形态+技术+换手)")
     print("- 买入: 信号后次日开盘价买入，涨停则延后")
-    print("- 卖出: 持有5/10/20天后收盘价卖出")
-    print("- 回测区间: 2020年以来")
+    print("- 卖出: 持有期结束后收盘价卖出")
+    print(f"- 回测区间: {args.start} 以来")
+    print(f"- 评分阈值: {args.min_score} (建议: 10-30，越低信号越多)")
     print()
 
-    daily_dir = './data/daily'
+    daily_dir = args.data_dir
     if not os.path.exists(daily_dir):
         print(f"错误: 数据目录 {daily_dir} 不存在")
         return
 
+    end_date = args.end or datetime.now().strftime('%Y-%m-%d')
+
     # 检查数据时间范围
     import glob
     sample_files = glob.glob(os.path.join(daily_dir, '*.csv'))[:5]
+    data_min_date = pd.to_datetime(args.start)
+    data_max_date = pd.to_datetime(end_date)
+
     if sample_files:
-        import pandas as pd
         dates = []
         for f in sample_files:
             try:
@@ -533,40 +549,29 @@ def main():
             except:
                 pass
         if dates:
-            print(f"样本数据时间范围: {min(dates)} ~ {max(dates)}")
-            if max(dates).year < 2020:
-                print("\n警告: 数据似乎不包含2020年以来的历史数据!")
-                print("请先运行: python download_history_2020.py")
-                return
+            actual_min = min(dates)
+            actual_max = max(dates)
+            print(f"数据时间范围: {actual_min.date()} ~ {actual_max.date()}")
 
-    # 检测数据实际日期范围，调整回测区间
-    # 如果数据不包含2020年以来的数据，则使用实际数据范围进行测试
-    data_min_date = min(dates) if dates else pd.to_datetime('2020-01-01')
-    data_max_date = max(dates) if dates else pd.to_datetime(datetime.now())
+            # 调整回测区间到实际数据范围
+            if actual_min > data_min_date:
+                data_min_date = actual_min
+                print(f"  调整开始日期为: {data_min_date.date()}")
+            if actual_max < pd.to_datetime(end_date):
+                data_max_date = actual_max - timedelta(days=max(args.hold_days))
+                print(f"  调整结束日期为: {data_max_date.date()} (预留持有期)")
 
-    if data_max_date.year < 2020:
-        # 数据时间范围不足，使用实际数据范围进行测试演示
-        print(f"\n注意: 当前数据仅包含 {data_min_date.date()} ~ {data_max_date.date()} ({len(set(dates))}个交易日)")
-        print("要使用2020年以来的完整数据回测，请先运行: python download_history_2020.py")
-        print("\n继续使用现有数据进行演示测试...\n")
-
-        # 调整参数适应短周期数据
-        backtest_start = data_min_date.strftime('%Y-%m-%d')
-        backtest_end = (data_max_date - timedelta(days=20)).strftime('%Y-%m-%d')  # 预留持有期
-        min_score = 10  # 降低评分阈值以增加样本
-    else:
-        backtest_start = '2020-01-01'
-        backtest_end = datetime.now().strftime('%Y-%m-%d')
-        min_score = 30
+    backtest_start = data_min_date.strftime('%Y-%m-%d')
+    backtest_end = data_max_date.strftime('%Y-%m-%d')
 
     # 创建回测器
     backtest = MonsterStockBacktest(
         daily_dir=daily_dir,
         start_date=backtest_start,
         end_date=backtest_end,
-        lookback_days=10,  # 使用较短的回看期适应数据
-        min_score=min_score,
-        hold_days_list=[1, 3, 5],  # 适应短数据周期
+        lookback_days=args.lookback,
+        min_score=args.min_score,
+        hold_days_list=args.hold_days,
         max_delay_days=3
     )
 

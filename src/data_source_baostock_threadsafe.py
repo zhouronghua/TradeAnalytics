@@ -1,6 +1,6 @@
 """
 线程安全的BaoStock数据源
-每个线程使用独立的BaoStock连接
+使用锁串行化baostock的全局操作，实现真正的多线程安全
 """
 
 import baostock as bs
@@ -10,6 +10,7 @@ from typing import Optional
 import sys
 import os
 import threading
+import time
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -17,21 +18,37 @@ from src.utils import setup_logger, format_date
 
 
 class ThreadSafeBaoStockDataSource:
-    """线程安全的BaoStock数据源"""
-    
+    """线程安全的BaoStock数据源 - 使用全局锁实现多线程安全"""
+
+    # 全局锁，用于串行化所有baostock操作
+    _global_lock = threading.Lock()
+    _global_logged_in = False
+    _global_login_time = None
+    _login_timeout = 300  # 登录超时5分钟
+
     def __init__(self):
         self.logger = setup_logger('BaoStock')
-        self.local = threading.local()  # 线程本地存储
-    
+
     def _ensure_login(self) -> bool:
-        """确保当前线程已登录"""
-        if not hasattr(self.local, 'logged_in') or not self.local.logged_in:
+        """确保已登录（全局锁保护）"""
+        with ThreadSafeBaoStockDataSource._global_lock:
+            # 检查是否已登录且未超时
+            if ThreadSafeBaoStockDataSource._global_logged_in:
+                if ThreadSafeBaoStockDataSource._global_login_time:
+                    elapsed = time.time() - ThreadSafeBaoStockDataSource._global_login_time
+                    if elapsed < self._login_timeout:
+                        return True
+                    else:
+                        # 超时，先登出
+                        self._logout_internal()
+
+            # 执行登录
             try:
                 lg = bs.login()
                 if lg.error_code == '0':
-                    self.local.logged_in = True
-                    thread_id = threading.current_thread().name
-                    self.logger.debug(f"线程 {thread_id} BaoStock登录成功")
+                    ThreadSafeBaoStockDataSource._global_logged_in = True
+                    ThreadSafeBaoStockDataSource._global_login_time = time.time()
+                    self.logger.debug(f"BaoStock全局登录成功")
                     return True
                 else:
                     self.logger.error(f"BaoStock登录失败: {lg.error_msg}")
@@ -39,286 +56,215 @@ class ThreadSafeBaoStockDataSource:
             except Exception as e:
                 self.logger.error(f"BaoStock登录异常: {e}")
                 return False
-        return True
-    
-    def _ensure_logout(self):
-        """确保当前线程登出"""
-        if hasattr(self.local, 'logged_in') and self.local.logged_in:
-            try:
-                bs.logout()
-                self.local.logged_in = False
-                thread_id = threading.current_thread().name
-                self.logger.debug(f"线程 {thread_id} BaoStock已登出")
-            except Exception as e:
-                self.logger.debug(f"登出异常: {e}")
-    
+
+    def _logout_internal(self):
+        """内部登出（不加锁，调用者需持有锁）"""
+        try:
+            bs.logout()
+        except:
+            pass
+        ThreadSafeBaoStockDataSource._global_logged_in = False
+        ThreadSafeBaoStockDataSource._global_login_time = None
+
+    def _execute_with_lock(self, func, *args, **kwargs):
+        """
+        在全局锁保护下执行baostock操作
+
+        流程：
+        1. 获取锁
+        2. 确保登录
+        3. 执行操作
+        4. 释放锁
+        """
+        with ThreadSafeBaoStockDataSource._global_lock:
+            if not self._ensure_login():
+                return None
+            return func(*args, **kwargs)
+
     def get_stock_list(self) -> Optional[pd.DataFrame]:
         """
-        获取股票列表
-        
-        Returns:
-            股票列表DataFrame
+        获取股票列表（线程安全）
         """
-        if not self._ensure_login():
-            return None
-        
-        try:
-            self.logger.info("从BaoStock获取股票列表...")
-            
-            # 获取所有A股股票，优先使用当天日期
+        def _query():
             query_date = datetime.now().strftime('%Y-%m-%d')
-            self.logger.info(f"查询日期: {query_date}")
             rs = bs.query_all_stock(day=query_date)
-            
+
             if rs.error_code != '0':
-                self.logger.error(f"获取股票列表失败: {rs.error_msg}")
-                return None
-            
-            # 转换为DataFrame
+                return None, rs.error_msg
+
             data_list = []
             while rs.next():
                 data_list.append(rs.get_row_data())
-            
-            stock_list = pd.DataFrame(data_list, columns=rs.fields)
-            
-            self.logger.info(f"从BaoStock获取到 {len(stock_list)} 条记录")
-            self.logger.info(f"字段列表: {list(stock_list.columns)}")
-            
-            # 检查是否为空，可能是非交易日
-            if len(stock_list) == 0:
-                self.logger.warning(f"查询日期 {query_date} 返回空数据，可能是非交易日")
-                
-                # 尝试查询最近的交易日（向前查询最多7天）
-                for days_back in range(1, 8):
-                    retry_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
-                    # 跳过周末
-                    retry_datetime = datetime.now() - timedelta(days=days_back)
-                    if retry_datetime.weekday() >= 5:  # 周六或周日
-                        continue
-                    
-                    self.logger.info(f"尝试查询 {retry_date}...")
-                    rs_retry = bs.query_all_stock(day=retry_date)
-                    
-                    if rs_retry.error_code == '0':
-                        data_list_retry = []
-                        while rs_retry.next():
-                            data_list_retry.append(rs_retry.get_row_data())
-                        
-                        if len(data_list_retry) > 0:
-                            self.logger.info(f"成功从 {retry_date} 获取到 {len(data_list_retry)} 条记录")
-                            stock_list = pd.DataFrame(data_list_retry, columns=rs_retry.fields)
-                            break
-                
-                # 如果仍然为空，返回空DataFrame
-                if len(stock_list) == 0:
-                    self.logger.warning("未能从最近7个工作日获取到股票列表")
-                    return pd.DataFrame(columns=['code', 'name'])
-            
-            # 过滤只保留A股（上交所和深交所）
-            if 'code' in stock_list.columns:
-                stock_list = stock_list[stock_list['code'].str.match(r'^(?:sh\.|sz\.)', na=False)]
-            else:
-                self.logger.error(f"返回的数据中没有'code'字段，可用字段: {list(stock_list.columns)}")
-                return None
-            
-            # 标准化格式
-            stock_list['code'] = stock_list['code'].str.replace('sh.', '').str.replace('sz.', '')
-            
-            # 检查并重命名列
-            rename_map = {}
-            if 'code_name' in stock_list.columns:
-                rename_map['code_name'] = 'name'
-            if 'tradeStatus' in stock_list.columns:
-                rename_map['tradeStatus'] = 'status'
-            
-            if rename_map:
-                stock_list.rename(columns=rename_map, inplace=True)
-                self.logger.info(f"列重命名: {rename_map}")
-            else:
-                self.logger.warning(f"未找到需要重命名的列，当前列: {list(stock_list.columns)}")
-            
-            # 检查是否有type字段，如果有则只保留股票类型
-            if 'type' in stock_list.columns:
-                original_count = len(stock_list)
-                # type=1 表示股票，type=2 表示指数，type=3 表示其他
-                stock_list = stock_list[stock_list['type'] == '1']
-                filtered_by_type = original_count - len(stock_list)
-                if filtered_by_type > 0:
-                    self.logger.info(f"根据type字段过滤 {filtered_by_type} 只非股票（指数等）")
-            
-            # 只保留交易状态为1的股票（正在交易）
-            if 'status' in stock_list.columns:
-                stock_list = stock_list[stock_list['status'] == '1']
-            else:
-                self.logger.warning("没有找到'status'字段，无法按交易状态过滤")
-            
-            # 精确过滤：只保留股票代码，排除基金、债券、指数等
-            # 上交所股票：60xxxx, 68xxxx（科创板）
-            # 深交所股票：002xxx, 003xxx（主板和中小板）, 300xxx（创业板）
-            # 注意：000001-000999范围内有大量指数，需要排除
-            def is_valid_stock(code):
-                if len(code) != 6:
-                    return False
-                # 上交所：60, 68开头
-                if code.startswith('60') or code.startswith('68'):
-                    return True
-                # 深交所中小板：002, 003开头
-                if code.startswith('002') or code.startswith('003'):
-                    return True
-                # 深交所创业板：300开头
-                if code.startswith('300'):
-                    return True
-                # 深交所主板：001开头（较新）
-                if code.startswith('001'):
-                    return True
-                return False
-            
-            original_count = len(stock_list)
-            stock_list = stock_list[stock_list['code'].apply(is_valid_stock)]
-            filtered_count = original_count - len(stock_list)
-            
-            if filtered_count > 0:
-                self.logger.info(f"代码规则过滤 {filtered_count} 只证券（基金、债券、指数等）")
-            
-            self.logger.info(f"获取到 {len(stock_list)} 只股票")
-            
-            # 检查必需的列是否存在
-            if 'code' not in stock_list.columns:
-                self.logger.error(f"结果中缺少'code'列，当前列: {list(stock_list.columns)}")
-                return None
-            
-            if 'name' not in stock_list.columns:
-                self.logger.warning(f"结果中缺少'name'列，将使用股票代码作为名称")
-                stock_list['name'] = stock_list['code']
-            
-            return stock_list[['code', 'name']]
-            
-        except Exception as e:
-            self.logger.error(f"获取股票列表异常: {e}")
+
+            return pd.DataFrame(data_list, columns=rs.fields), None
+
+        result, error = self._execute_with_lock(_query)
+
+        if error:
+            self.logger.error(f"获取股票列表失败: {error}")
             return None
-    
-    def get_stock_history(self, stock_code: str, start_date: str, 
+
+        if result is None or result.empty:
+            # 尝试查询最近的交易日
+            for days_back in range(1, 8):
+                retry_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+                retry_datetime = datetime.now() - timedelta(days=days_back)
+                if retry_datetime.weekday() >= 5:
+                    continue
+
+                def _retry_query():
+                    rs = bs.query_all_stock(day=retry_date)
+                    if rs.error_code != '0':
+                        return None, rs.error_msg
+                    data_list = []
+                    while rs.next():
+                        data_list.append(rs.get_row_data())
+                    return pd.DataFrame(data_list, columns=rs.fields), None
+
+                result, error = self._execute_with_lock(_retry_query)
+                if result is not None and not result.empty:
+                    break
+
+        if result is None or result.empty:
+            return pd.DataFrame(columns=['code', 'name'])
+
+        # 过滤只保留A股
+        if 'code' in result.columns:
+            result = result[result['code'].str.match(r'^(?:sh\.|sz\.)', na=False)]
+
+        # 标准化格式
+        result['code'] = result['code'].str.replace('sh.', '').str.replace('sz.', '')
+
+        # 过滤有效股票代码
+        def is_valid_stock(code):
+            if len(code) != 6:
+                return False
+            if code.startswith('60') or code.startswith('68'):
+                return True
+            if code.startswith('002') or code.startswith('003'):
+                return True
+            if code.startswith('300'):
+                return True
+            if code.startswith('001'):
+                return True
+            return False
+
+        result = result[result['code'].apply(is_valid_stock)]
+
+        # 标准化列名
+        if 'code_name' in result.columns:
+            result = result.rename(columns={'code_name': 'name'})
+        elif 'name' not in result.columns:
+            result['name'] = result['code']
+
+        self.logger.info(f"获取到 {len(result)} 只股票")
+        return result[['code', 'name']]
+
+    def get_stock_history(self, stock_code: str,
+                         start_date: str,
                          end_date: str) -> Optional[pd.DataFrame]:
         """
         获取股票历史数据（线程安全）
-        
-        Args:
-            stock_code: 股票代码（6位数字）
-            start_date: 开始日期 (YYYY-MM-DD)
-            end_date: 结束日期 (YYYY-MM-DD)
-        
-        Returns:
-            历史数据DataFrame
         """
-        if not self._ensure_login():
-            return None
-        
-        try:
+        def _query():
             # 添加市场前缀
             if stock_code.startswith('6'):
                 bs_code = f'sh.{stock_code}'
             else:
                 bs_code = f'sz.{stock_code}'
-            
-            # 获取日K线数据
+
             rs = bs.query_history_k_data_plus(
                 bs_code,
                 "date,open,high,low,close,volume,amount",
                 start_date=start_date,
                 end_date=end_date,
-                frequency="d",  # 日线
+                frequency="d",
                 adjustflag="2"  # 前复权
             )
-            
+
             if rs.error_code != '0':
-                self.logger.warning(f"股票 {stock_code} 数据获取失败: {rs.error_msg}")
-                return None
-            
-            # 转换为DataFrame
+                return None, rs.error_msg
+
             data_list = []
             while rs.next():
                 data_list.append(rs.get_row_data())
-            
+
             if not data_list:
-                return None
-            
+                return None, None
+
             df = pd.DataFrame(data_list, columns=rs.fields)
-            
+
             # 转换数据类型
             for col in ['open', 'high', 'low', 'close']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-            
             df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0).astype('int64')
             df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0).astype('int64')
-            
-            return df
-            
-        except Exception as e:
-            self.logger.error(f"获取股票 {stock_code} 数据异常: {e}")
+
+            return df, None
+
+        result, error = self._execute_with_lock(_query)
+
+        if error:
+            self.logger.warning(f"股票 {stock_code} 数据获取失败: {error}")
             return None
-    
+
+        return result
+
     def cleanup(self):
-        """清理当前线程的连接"""
-        self._ensure_logout()
+        """清理连接（线程安全）"""
+        with ThreadSafeBaoStockDataSource._global_lock:
+            self._logout_internal()
 
 
-def test_thread_safety():
-    """测试线程安全性"""
+def test_multithreaded():
+    """测试多线程下载"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     import time
-    
+
     print("=" * 70)
-    print("测试线程安全的BaoStock")
+    print("测试BaoStock多线程下载（5线程并发）")
     print("=" * 70)
-    
+
     source = ThreadSafeBaoStockDataSource()
-    
-    def download_stock(stock_code):
-        """在线程中下载股票"""
-        thread_name = threading.current_thread().name
-        print(f"[{thread_name}] 开始下载 {stock_code}")
-        
-        end_date = datetime.now().strftime('%Y-%m-%d')
-        start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
-        
-        df = source.get_stock_history(stock_code, start_date, end_date)
-        
-        if df is not None:
-            print(f"[{thread_name}] {stock_code} 成功: {len(df)} 天")
-            # 验证数据（检查日期列）
-            if 'date' in df.columns and len(df) > 0:
-                first_date = df.iloc[0]['date']
-                last_date = df.iloc[-1]['date']
-                print(f"[{thread_name}] {stock_code} 日期范围: {first_date} - {last_date}")
-            return True
-        else:
-            print(f"[{thread_name}] {stock_code} 失败")
-            return False
-    
-    # 测试多线程
-    test_stocks = ['000001', '600000', '000002', '600001', '000004']
-    
-    print("\n测试1：单线程（对照组）")
-    print("-" * 70)
-    for stock in test_stocks[:2]:
-        download_stock(stock)
-        time.sleep(1)
-    
-    print("\n测试2：多线程（3个并发）")
-    print("-" * 70)
-    threads = []
-    for stock in test_stocks:
-        t = threading.Thread(target=download_stock, args=(stock,))
-        threads.append(t)
-        t.start()
-    
-    for t in threads:
-        t.join()
-    
-    print("\n" + "=" * 70)
-    print("测试完成")
-    print("如果看到正确的日期范围，说明线程安全")
+
+    # 测试股票列表
+    test_stocks = ['600000', '000001', '600001', '000002', '600825',
+                   '600826', '600827', '600828', '600829', '600830']
+
+    start_time = time.time()
+    results = {'success': 0, 'failed': 0}
+
+    def download_one(code):
+        try:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            df = source.get_stock_history(code, start_date, end_date)
+            if df is not None and not df.empty:
+                return code, True, len(df)
+            else:
+                return code, False, 0
+        except Exception as e:
+            return code, False, str(e)
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(download_one, code): code for code in test_stocks}
+
+        for future in as_completed(futures):
+            code, success, info = future.result()
+            if success:
+                results['success'] += 1
+                print(f"✓ {code}: {info} 条数据")
+            else:
+                results['failed'] += 1
+                print(f"✗ {code}: 失败 ({info})")
+
+    elapsed = time.time() - start_time
     print("=" * 70)
+    print(f"结果: 成功 {results['success']}, 失败 {results['failed']}, 耗时 {elapsed:.2f} 秒")
+    print("=" * 70)
+
+    source.cleanup()
 
 
 if __name__ == '__main__':
-    test_thread_safety()
+    test_multithreaded()
