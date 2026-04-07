@@ -5,7 +5,7 @@
 
 import requests
 import json
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime, timedelta
 import sys
 import os
@@ -61,9 +61,10 @@ class NotificationService:
         
         self.logger.info(f"消息推送服务初始化完成 (启用: {self.enabled}, 类型: {self.push_type})")
     
-    def send_analysis_result(self, matched_stocks: List[Dict], 
+    def send_analysis_result(self, matched_stocks: List[Dict],
                             analysis_date: str = None,
-                            include_history: bool = True) -> bool:
+                            include_history: bool = True,
+                            strategy_meta: Optional[Dict[str, Any]] = None) -> bool:
         """
         发送分析结果通知
         
@@ -71,6 +72,7 @@ class NotificationService:
             matched_stocks: 符合条件的股票列表
             analysis_date: 分析日期
             include_history: 是否包含历史对比
+            strategy_meta: 与 resolve_screening_params 一致的字典（用于标题与条件说明）
         
         Returns:
             是否发送成功
@@ -87,14 +89,25 @@ class NotificationService:
         if analysis_date is None:
             analysis_date = datetime.now().strftime('%Y-%m-%d')
         
-        title = f"股票分析结果 {analysis_date}"
+        strategy_meta = strategy_meta or {}
+        ma = strategy_meta.get('ma_period', '')
+        vol = strategy_meta.get('volume_ratio_threshold', '')
+        if ma != '' and vol != '':
+            tag = '验证' if strategy_meta.get('from_validated') else '配置'
+            title = (
+                f"选股[{tag}] {analysis_date} MA{ma} 量比>={vol} | {len(matched_stocks)}只"
+            )
+        else:
+            title = f"股票分析结果 {analysis_date}"
         
         # 获取历史数据（如果需要）
         history_data = None
         if include_history:
             history_data = self._get_history_results()
         
-        content = self._format_stocks_content(matched_stocks, analysis_date, history_data)
+        content = self._format_stocks_content(
+            matched_stocks, analysis_date, history_data, strategy_meta=strategy_meta
+        )
         
         # 根据类型发送
         if self.push_type == 'serverchan':
@@ -156,23 +169,45 @@ class NotificationService:
             self.logger.error(f"获取历史结果失败: {e}")
             return None
     
-    def _format_stocks_content(self, stocks: List[Dict], date: str, 
-                               history: Optional[List[Tuple[str, int]]] = None) -> str:
+    def _format_stocks_content(self, stocks: List[Dict], date: str,
+                               history: Optional[List[Tuple[str, int]]] = None,
+                               strategy_meta: Optional[Dict[str, Any]] = None) -> str:
         """
         格式化股票列表为推送内容
         
         Args:
             stocks: 股票列表
             date: 分析日期
+            strategy_meta: 实际筛选参数（与定时任务/验证策略一致）
         
         Returns:
             格式化后的内容
         """
-        # 标题摘要
-        content = f"## 📊 今日摘要\n\n"
+        strategy_meta = strategy_meta or {}
+        # 标题摘要（条件与 scheduler + StockFilter 一致，勿硬编码倍数）
+        content = "## 今日摘要\n\n"
         content += f"- 分析日期: {date}\n"
         content += f"- 符合条件股票: **{len(stocks)}** 只\n"
-        content += f"- 筛选条件: 成交量≥5倍 且 价格>均线\n\n"
+        if strategy_meta.get('ma_period') is not None and strategy_meta.get(
+            'volume_ratio_threshold'
+        ) is not None:
+            ma = strategy_meta.get('ma_period', '')
+            vol = strategy_meta.get('volume_ratio_threshold', '')
+            src = (
+                '已验证 best_strategy.json'
+                if strategy_meta.get('from_validated')
+                else 'config.ini [Analysis]'
+            )
+            path_note = strategy_meta.get('strategy_file') or ''
+            path_line = f"\n- 策略文件: {path_note}" if path_note else ""
+            cw = strategy_meta.get('composite_win_rate_pct')
+            cw_line = f"\n- 回测综合胜率(5/10/20日): {cw}%" if cw is not None else ""
+            content += (
+                f"- 筛选条件: 量比(当日成交量/昨量)>={vol}，"
+                f"收盘价>=MA{ma}（来源: {src}）{path_line}{cw_line}\n\n"
+            )
+        else:
+            content += "- 筛选条件: 见任务日志中的 MA 与量比阈值\n\n"
         
         # 历史趋势对比
         if history:

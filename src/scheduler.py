@@ -18,6 +18,8 @@ from src.utils import setup_logger, Config, is_trading_day
 from src.data_downloader import DataDownloader
 from src.stock_filter import StockFilter
 from src.notification import NotificationService
+from src.email_sender import EmailSender
+from src.validated_strategy import resolve_screening_params
 
 
 class TaskScheduler:
@@ -30,6 +32,7 @@ class TaskScheduler:
         Args:
             config_file: 配置文件路径
         """
+        self.config_file = config_file
         self.config = Config(config_file)
         self.logger = setup_logger('TaskScheduler')
         
@@ -42,6 +45,7 @@ class TaskScheduler:
         self.downloader = DataDownloader(config_file)
         self.filter = StockFilter(config_file)
         self.notifier = NotificationService(config_file)
+        self.email_sender = EmailSender(config_file)
         
         # 状态管理
         self.is_running = False
@@ -157,9 +161,26 @@ class TaskScheduler:
                 self._notify_complete(True, message, 0)
                 return
 
-            # 4. 执行筛选
-            self.logger.info("步骤3: 执行股票筛选...")
-            
+            # 4. 执行筛选（优先使用 strategy_agent 产出的已验证 best_strategy.json）
+            self.logger.info("步骤3: 解析选股策略并筛选股票...")
+            ma_period, volume_ratio_threshold, strat_meta = resolve_screening_params(
+                self.config,
+                self.config_file,
+            )
+            if ma_period is None or volume_ratio_threshold is None:
+                message = "无有效选股参数（未找到已验证策略且未允许回退），已跳过筛选"
+                self.logger.error(message)
+                self._notify_complete(False, message, 0)
+                return
+
+            self.logger.info(
+                "本次筛选参数: MA=%s 量比>=%s | from_validated=%s | file=%s",
+                ma_period,
+                volume_ratio_threshold,
+                strat_meta.get("from_validated"),
+                strat_meta.get("strategy_file") or "—",
+            )
+
             def filter_progress(current, total, stock_code, matched):
                 """筛选进度回调"""
                 if current % 50 == 0:
@@ -169,27 +190,61 @@ class TaskScheduler:
                         total,
                         f'已筛选 {current}/{total} 只股票 ({stock_code})'
                     )
-            
-            matched_stocks, output_file = self.filter.run_filter(callback=filter_progress)
+
+            matched_stocks, output_file = self.filter.run_filter(
+                callback=filter_progress,
+                ma_period=ma_period,
+                volume_ratio_threshold=volume_ratio_threshold,
+            )
             
             matched_count = len(matched_stocks)
             self.logger.info(f"筛选完成: 找到 {matched_count} 只符合条件的股票")
             self._notify_progress('筛选股票', stock_count, stock_count, 
                                 f'筛选完成: {matched_count} 只符合条件')
             
-            # 5. 发送微信推送
+            analysis_date = datetime.now().strftime('%Y-%m-%d')
+
+            # 5. 邮件通知（量价+均线筛选结果）
+            try:
+                if self.email_sender.enabled:
+                    if matched_stocks:
+                        ok = self.email_sender.send_volume_ma_screening_report(
+                            matched_stocks,
+                            analysis_date,
+                            strat_meta,
+                        )
+                        if ok:
+                            self.logger.info("选股结果邮件已发送")
+                        else:
+                            self.logger.warning("选股结果邮件发送失败或未配置收件人")
+                    else:
+                        ok = self.email_sender.send_volume_ma_screening_empty(
+                            analysis_date,
+                            strat_meta,
+                        )
+                        if ok:
+                            self.logger.info("无标的通知邮件已发送")
+                else:
+                    self.logger.info("邮件功能未启用，跳过选股邮件")
+            except Exception as e:
+                self.logger.error(f"选股邮件异常: {e}")
+
+            # 6. 微信推送（可选）
             if matched_stocks:
                 try:
-                    analysis_date = datetime.now().strftime('%Y-%m-%d')
-                    push_success = self.notifier.send_analysis_result(matched_stocks, analysis_date)
+                    push_success = self.notifier.send_analysis_result(
+                        matched_stocks,
+                        analysis_date,
+                        strategy_meta=strat_meta,
+                    )
                     if push_success:
                         self.logger.info("微信推送成功")
                     else:
                         self.logger.warning("微信推送失败或未启用")
                 except Exception as e:
                     self.logger.error(f"微信推送异常: {e}")
-            
-            # 6. 完成
+
+            # 7. 完成
             if output_file:
                 message = f"任务完成！找到 {matched_count} 只符合条件的股票，结果已保存到 {output_file}"
             else:

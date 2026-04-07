@@ -22,6 +22,12 @@ enabled = true
 run_time = 15:30
 weekdays_only = true
 
+[StrategyAgent]
+# strategy_agent_cli 生成的 best_strategy.json；留空则自动选用 build/strategy_agent/* 下修改时间最新且 validated=true 的文件
+strategy_json_path =
+# 无已验证策略时，是否回退到下方 [Analysis] 的 ma_period / volume_ratio_threshold
+fallback_to_analysis_ini = true
+
 [Download]
 # 并发线程数：服务器限制，使用单线程避免拒绝连接
 max_workers = 1

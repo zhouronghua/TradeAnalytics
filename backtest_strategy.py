@@ -105,9 +105,11 @@ class StrategyBacktest:
                 # 按日期排序
                 df = df.sort_values('date').reset_index(drop=True)
 
-                # 计算指标 - 使用实际可用数据长度调整MA周期
-                effective_ma_period = min(self.ma_period, max(20, len(df) - 5))
-                df = self.analyzer.analyze_stock(df, ma_period=effective_ma_period)
+                if len(df) < self.ma_period + 5:
+                    skipped_count += 1
+                    continue
+
+                df = self.analyzer.analyze_stock(df, ma_period=self.ma_period)
 
                 if df is not None and len(df) > 0:
                     stock_data[stock_code] = df
@@ -166,6 +168,9 @@ class StrategyBacktest:
                 'ma_value': float(row[ma_column]),
                 'volume': float(row['volume']),
             }
+            for col, key in [('open', 'bar_open'), ('high', 'bar_high'), ('low', 'bar_low')]:
+                if col in row.index and pd.notna(row[col]):
+                    signal[key] = float(row[col])
 
             # 如果有前一日数据，计算前一日涨幅
             if idx >= 1:
@@ -273,6 +278,35 @@ class StrategyBacktest:
             return trades_df
         else:
             return pd.DataFrame()
+
+    def run_backtest_on_raw(self, raw_by_code: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """
+        在已缓存的日线 OHLCV 上回测（每条仅 copy 后计算指标），适用于参数网格搜索
+        """
+        self.trades = []
+        ma = self.ma_period
+        total_signals = 0
+        for stock_code, df in raw_by_code.items():
+            if df is None or len(df) < ma + 5:
+                continue
+            df_an = self.analyzer.analyze_stock(df.copy(), ma_period=ma)
+            if df_an is None or df_an.empty:
+                continue
+            for idx in range(ma, len(df_an)):
+                is_signal, signal = self.check_buy_signal(df_an, idx)
+                if not is_signal:
+                    continue
+                total_signals += 1
+                signal['stock_code'] = stock_code
+                signal['stock_name'] = get_stock_name(stock_code)
+                returns = self.calculate_future_returns(df_an, idx)
+                signal.update(returns)
+                self.trades.append(signal.copy())
+        self.logger.info(f"回测完成！共发现 {total_signals} 个买入信号 (MA{ma}, 量比>={self.volume_ratio_threshold})")
+        if not self.trades:
+            return pd.DataFrame()
+        trades_df = pd.DataFrame(self.trades)
+        return trades_df.sort_values('date')
 
     def analyze_results(self, trades_df: pd.DataFrame, 
                        profit_threshold: float = 0.0) -> Dict:

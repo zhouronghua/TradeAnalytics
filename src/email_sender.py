@@ -8,7 +8,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import pandas as pd
 
 import sys
@@ -281,6 +281,192 @@ class EmailSender:
             reasons.append("换手率异常活跃")
 
         return reasons
+
+    def send_volume_ma_screening_report(
+        self,
+        matched_stocks: List[Dict],
+        analysis_date: Optional[str],
+        strategy_meta: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """发送放量站上均线选股结果（与 strategy_agent / 定时筛选一致）"""
+        if not self.enabled:
+            self.logger.warning("邮件功能未启用")
+            return False
+        if analysis_date is None:
+            analysis_date = datetime.now().strftime("%Y-%m-%d")
+        strategy_meta = strategy_meta or {}
+        ma = strategy_meta.get("ma_period", "")
+        vol = strategy_meta.get("volume_ratio_threshold", "")
+        tag = "已验证策略" if strategy_meta.get("from_validated") else "配置回退"
+        subject = f"[选股-{tag}] {analysis_date} MA{ma} 量比>={vol} | {len(matched_stocks)} 只"
+        html = self._build_volume_ma_screening_html(
+            matched_stocks, analysis_date, strategy_meta
+        )
+        if self._send_email(subject, html):
+            return True
+        md = self._volume_ma_to_text(matched_stocks, analysis_date, strategy_meta)
+        return self._notify_serverchan_fallback(subject, md)
+
+    def send_volume_ma_screening_empty(
+        self,
+        analysis_date: Optional[str],
+        strategy_meta: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """当日无符合放量+均线条件的股票时发送说明邮件"""
+        if not self.enabled:
+            self.logger.warning("邮件功能未启用")
+            return False
+        if analysis_date is None:
+            analysis_date = datetime.now().strftime("%Y-%m-%d")
+        strategy_meta = strategy_meta or {}
+        ma = strategy_meta.get("ma_period", "")
+        vol = strategy_meta.get("volume_ratio_threshold", "")
+        tag = "已验证策略" if strategy_meta.get("from_validated") else "配置回退"
+        subject = f"[选股-{tag}] {analysis_date} MA{ma} 量比>={vol} | 无标的"
+        detail = self._strategy_meta_text_html(strategy_meta)
+        html = f"""
+        <html><head><meta charset="utf-8"></head>
+        <body style="font-family:'Microsoft YaHei',Arial,sans-serif;padding:20px;background:#f5f5f5;">
+        <div style="max-width:900px;margin:0 auto;background:#fff;padding:24px;border-radius:8px;">
+            <h2 style="margin-top:0;">量价选股结果</h2>
+            <p>分析日期: <b>{analysis_date}</b></p>
+            <p>本次扫描未发现同时满足「量比阈值」且「收盘站上均线」的股票。</p>
+            {detail}
+            <p style="color:#999;font-size:11px;margin-top:24px;">
+            发送时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | TradeAnalytics
+            </p>
+        </div></body></html>
+        """
+        if self._send_email(subject, html):
+            return True
+        text = (
+            f"分析日期: {analysis_date}\n"
+            "未发现符合条件的股票。\n\n"
+            + self._strategy_meta_plain(strategy_meta)
+        )
+        return self._notify_serverchan_fallback(subject, text)
+
+    def _strategy_meta_plain(self, strategy_meta: Dict[str, Any]) -> str:
+        lines = [
+            f"参数: MA{strategy_meta.get('ma_period','')} 量比>={strategy_meta.get('volume_ratio_threshold','')}",
+            f"来源: {'已验证 strategy JSON' if strategy_meta.get('from_validated') else 'config.ini 回退'}",
+        ]
+        if strategy_meta.get("strategy_file"):
+            lines.append(f"策略文件: {strategy_meta['strategy_file']}")
+        cw = strategy_meta.get("composite_win_rate_pct")
+        if cw is not None:
+            lines.append(f"历史回测综合胜率: {cw}%")
+        return "\n".join(lines)
+
+    def _strategy_meta_text_html(self, strategy_meta: Dict[str, Any]) -> str:
+        cw = strategy_meta.get("composite_win_rate_pct")
+        cw_s = f"{cw}%" if cw is not None else "—"
+        src = (
+            "已验证 strategy_agent 输出"
+            if strategy_meta.get("from_validated")
+            else "config.ini [Analysis] 回退"
+        )
+        fpath = strategy_meta.get("strategy_file") or "—"
+        return f"""
+        <div style="background:#f8f9fa;padding:12px 16px;border-radius:6px;font-size:14px;color:#333;">
+        <p style="margin:4px 0;"><b>条件</b>：收盘 &gt;= MA{strategy_meta.get("ma_period","")}，
+        量比 &gt;= {strategy_meta.get("volume_ratio_threshold","")}</p>
+        <p style="margin:4px 0;"><b>参数来源</b>：{src}</p>
+        <p style="margin:4px 0;"><b>策略文件</b>：{fpath}</p>
+        <p style="margin:4px 0;"><b>历史综合胜率(5/10/20日)</b>：{cw_s}</p>
+        </div>
+        """
+
+    def _build_volume_ma_screening_html(
+        self,
+        matched_stocks: List[Dict],
+        analysis_date: str,
+        strategy_meta: Dict[str, Any],
+    ) -> str:
+        rows = ""
+        max_show = 60
+        ma_n = strategy_meta.get("ma_period", "")
+        for i, st in enumerate(matched_stocks):
+            if i >= max_show:
+                rows += (
+                    f"<tr><td colspan='7' style='text-align:center;color:#888;'>"
+                    f"其余 {len(matched_stocks) - max_show} 只略，见 CSV 目录 data/results</td></tr>"
+                )
+                break
+            code = str(st.get("code", "")).zfill(6)
+            name = st.get("name", code)
+            dt = st.get("date", "")
+            if hasattr(dt, "strftime"):
+                dt = dt.strftime("%Y-%m-%d")
+            close = float(st.get("close", 0) or 0)
+            ma = float(st.get("ma", 0) or 0)
+            vr = float(st.get("volume_ratio", 0) or 0)
+            bg = "#fff" if i % 2 else "#fafafa"
+            rows += f"""
+            <tr style="background:{bg};">
+            <td style="padding:6px 8px;">{i + 1}</td>
+            <td style="padding:6px 8px;">{code}</td>
+            <td style="padding:6px 8px;">{name}</td>
+            <td style="padding:6px 8px;">{dt}</td>
+            <td style="padding:6px 8px;text-align:right;">{close:.2f}</td>
+            <td style="padding:6px 8px;text-align:right;">{ma:.2f}</td>
+            <td style="padding:6px 8px;text-align:right;">{vr:.2f}</td>
+            </tr>"""
+
+        detail = self._strategy_meta_text_html(strategy_meta)
+        html = f"""
+        <html><head><meta charset="utf-8"></head>
+        <body style="font-family:'Microsoft YaHei',Arial,sans-serif;margin:0;padding:20px;background:#f5f5f5;">
+        <div style="max-width:1000px;margin:0 auto;background:#fff;border-radius:8px;
+        box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+        <div style="padding:22px 28px;border-bottom:1px solid #eee;">
+            <h1 style="margin:0;font-size:20px;color:#2c3e50;">量价选股 · MA{ma_n}</h1>
+            <p style="margin:8px 0 0 0;color:#666;">分析日期 {analysis_date}，
+            共 {len(matched_stocks)} 只</p>
+        </div>
+        <div style="padding:20px 28px;">
+        {detail}
+        <div style="overflow-x:auto;margin-top:16px;">
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+        <thead><tr style="background:#34495e;color:#fff;">
+        <th style="padding:8px;">#</th><th style="padding:8px;">代码</th><th style="padding:8px;">名称</th>
+        <th style="padding:8px;">数据日</th>
+        <th style="padding:8px;">收盘</th><th style="padding:8px;">MA{ma_n}</th><th style="padding:8px;">量比</th>
+        </tr></thead><tbody>{rows}</tbody></table>
+        </div>
+        <p style="color:#999;font-size:11px;margin-top:18px;">
+        发送时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 仅供参考，不构成投资建议</p>
+        </div></div></body></html>
+        """
+        return html
+
+    def _volume_ma_to_text(
+        self,
+        matched_stocks: List[Dict],
+        analysis_date: str,
+        strategy_meta: Dict[str, Any],
+    ) -> str:
+        max_rows = self.config.getint("Notification", "push_max_stocks", fallback=25)
+        lines = [
+            self._strategy_meta_plain(strategy_meta),
+            "",
+            f"分析日期: {analysis_date}  数量: {len(matched_stocks)}",
+            "",
+        ]
+        for i, st in enumerate(matched_stocks):
+            if i >= max_rows:
+                lines.append(f"... 其余 {len(matched_stocks) - max_rows} 只略")
+                break
+            code = str(st.get("code", "")).zfill(6)
+            name = st.get("name", code)
+            dt = st.get("date", "")
+            if hasattr(dt, "strftime"):
+                dt = dt.strftime("%Y-%m-%d")
+            lines.append(
+                f"- {code} {name} {dt} 收{float(st.get('close',0) or 0):.2f} "
+                f"量比{float(st.get('volume_ratio',0) or 0):.2f}"
+            )
+        return "\n".join(lines)
 
     def _send_email(self, subject: str, html_body: str) -> bool:
         """发送HTML邮件"""

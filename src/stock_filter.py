@@ -236,39 +236,63 @@ class StockFilter:
             self.logger.error(f"保存结果失败: {e}")
             return False
     
-    def run_filter(self, callback: Callable = None) -> tuple:
+    def run_filter(
+        self,
+        callback: Callable = None,
+        ma_period: int = None,
+        volume_ratio_threshold: float = None,
+    ) -> tuple:
         """
         执行完整的筛选流程
-        
+
         Args:
             callback: 进度回调函数
-        
+            ma_period: 覆盖均线周期（默认使用 [Analysis] 配置）
+            volume_ratio_threshold: 覆盖量比阈值
+
         Returns:
             (符合条件的股票列表, 结果文件路径)
         """
-        self.logger.info("开始执行股票筛选...")
-        
-        # 获取股票列表
-        stock_list = self.get_stock_list()
-        if stock_list is None:
-            self.logger.error("无法获取股票列表")
-            return [], None
-        
-        # 筛选股票
-        matched_stocks = self.filter_all_stocks(stock_list, callback)
-        
-        if not matched_stocks:
-            self.logger.warning("没有找到符合条件的股票")
-            return [], None
-        
-        # 保存结果
-        date_str = datetime.now().strftime('%Y%m%d')
-        output_file = os.path.join(self.results_dir, f'filtered_{date_str}.csv')
-        
-        if self.save_results(matched_stocks, output_file):
-            return matched_stocks, output_file
-        else:
+        old_ma = self.ma_period
+        old_vr = self.volume_ratio_threshold
+        old_analyzer_ma = self.analyzer.ma_period
+        if ma_period is not None:
+            self.ma_period = int(ma_period)
+            self.analyzer.ma_period = self.ma_period
+        if volume_ratio_threshold is not None:
+            self.volume_ratio_threshold = float(volume_ratio_threshold)
+
+        try:
+            self.logger.info(
+                "开始执行股票筛选 (MA%s, 量比>=%s)...",
+                self.ma_period,
+                self.volume_ratio_threshold,
+            )
+
+            # 获取股票列表
+            stock_list = self.get_stock_list()
+            if stock_list is None:
+                self.logger.error("无法获取股票列表")
+                return [], None
+
+            # 筛选股票
+            matched_stocks = self.filter_all_stocks(stock_list, callback)
+
+            if not matched_stocks:
+                self.logger.warning("没有找到符合条件的股票")
+                return [], None
+
+            # 保存结果
+            date_str = datetime.now().strftime('%Y%m%d')
+            output_file = os.path.join(self.results_dir, f'filtered_{date_str}.csv')
+
+            if self.save_results(matched_stocks, output_file):
+                return matched_stocks, output_file
             return matched_stocks, None
+        finally:
+            self.ma_period = old_ma
+            self.volume_ratio_threshold = old_vr
+            self.analyzer.ma_period = old_analyzer_ma
     
     def get_history_results(self, days: int = 30) -> List[str]:
         """
