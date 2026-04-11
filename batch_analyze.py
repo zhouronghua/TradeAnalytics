@@ -15,7 +15,8 @@ import argparse
 import sys
 import os
 import glob
-from datetime import datetime
+from datetime import datetime, timedelta
+import pandas as pd
 
 if sys.version_info[0] < 3:
     sys.stderr.write(
@@ -88,6 +89,85 @@ def download_data(config_file: str, logger) -> bool:
         return False
 
 
+def download_latest_year_data(config_file: str, logger) -> bool:
+    """下载最近一年股票数据（使用增量更新机制）"""
+    logger.info("开始下载最近一年数据...")
+    try:
+        downloader = DataDownloader(config_file)
+
+        stock_list = downloader.download_stock_list()
+        if stock_list is None or stock_list.empty:
+            logger.error("下载股票列表失败")
+            return False
+        logger.info(f"股票列表: {len(stock_list)} 只")
+
+        def progress(current, total, stock_code, matched):
+            if current % 500 == 0:
+                logger.info(f"  下载进度: {current}/{total}")
+
+        # DataDownloader的update_stock_data会增量更新
+        # 对于新数据或过期数据，它会自动下载最近的数据
+        success, fail = downloader.download_all_stocks(
+            stock_list, callback=progress)
+        logger.info(f"最近一年数据下载完成: 成功{success}, 失败{fail}")
+        return True
+
+    except Exception as e:
+        logger.error(f"最近一年数据下载失败: {e}")
+        return False
+
+
+def check_data_freshness(config_file: str, logger) -> tuple[bool, str]:
+    """
+    检查数据新鲜度
+
+    Returns:
+        (是否最新, 状态信息)
+    """
+    config = Config(config_file)
+    daily_dir = config.get('Paths', 'daily_dir', fallback='./data/daily')
+
+    csv_files = glob.glob(os.path.join(daily_dir, '*.csv'))
+    if not csv_files:
+        return False, "本地无数据文件"
+
+    # 检查所有CSV文件中的最新日期
+    latest_date = None
+    checked_files = 0
+    sample_size = min(100, len(csv_files))  # 最多检查100个文件
+
+    for csv_file in csv_files[:sample_size]:
+        try:
+            df = pd.read_csv(csv_file, nrows=5)  # 只读前几行
+            if 'date' in df.columns:
+                dates = pd.to_datetime(df['date'], errors='coerce')
+                if not dates.empty:
+                    file_latest = dates.max()
+                    if latest_date is None or file_latest > latest_date:
+                        latest_date = file_latest
+            checked_files += 1
+        except Exception as e:
+            logger.debug(f"检查文件 {csv_file} 失败: {e}")
+            continue
+
+    if latest_date is None:
+        return False, f"无法从 {checked_files} 个文件中提取日期"
+
+    today = datetime.now()
+    days_diff = (today - latest_date).days
+
+    # 计算一年前日期
+    one_year_ago = today - timedelta(days=365)
+
+    if latest_date < one_year_ago:
+        return False, f"数据已过期: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距今天 {days_diff} 天，缺少最近一年数据"
+
+    if days_diff > 7:
+        return False, f"数据不够新: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距今天 {days_diff} 天"
+
+    return True, f"数据较新: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距今天 {days_diff} 天"
+
+
 def run_monster_analysis(config_file: str, logger):
     """运行妖股筛选"""
     config = Config(config_file)
@@ -154,20 +234,31 @@ def main():
         logger.info("今天不是交易日，跳过分析 (使用 --force-non-trading 可强制执行)")
         return
 
-    # 步骤1: 下载数据
+    # 步骤1: 检查并确保数据最新
     if not args.skip_download:
         daily_dir = Config(args.config).get('Paths', 'daily_dir', fallback='./data/daily')
         csv_count = len(glob.glob(os.path.join(daily_dir, '*.csv')))
+
         if csv_count == 0:
-            logger.info("本地无数据，必须先下载")
-            if not download_data(args.config, logger):
+            logger.info("本地无数据，需要先下载")
+            if not download_latest_year_data(args.config, logger):
                 logger.error("数据下载失败，退出")
                 sys.exit(1)
         else:
-            logger.info(f"本地已有 {csv_count} 只股票数据，尝试增量更新...")
-            download_data(args.config, logger)
+            # 检查数据新鲜度
+            logger.info(f"本地已有 {csv_count} 只股票数据，检查数据新鲜度...")
+            is_fresh, status_msg = check_data_freshness(args.config, logger)
+            logger.info(f"  {status_msg}")
+
+            if not is_fresh:
+                logger.info("数据不够新，开始下载最近一年数据...")
+                if not download_latest_year_data(args.config, logger):
+                    logger.warning("最近一年数据下载失败，将尝试使用现有数据继续")
+            else:
+                logger.info("数据较新，尝试增量更新...")
+                download_data(args.config, logger)
     else:
-        logger.info("跳过数据下载")
+        logger.info("跳过数据下载（--skip-download）")
 
     # 步骤2: 分析
     if args.volume_only:
