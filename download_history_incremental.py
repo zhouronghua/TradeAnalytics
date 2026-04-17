@@ -131,7 +131,8 @@ def download_stock_incremental(downloader: DataDownloader, stock_code: str,
 
 def download_all_incremental(start_year: int = 2020, max_workers: int = 5,
                             data_source: str = 'tushare',
-                            tushare_token: str = None) -> dict:
+                            tushare_token: str = None,
+                            force: bool = False) -> dict:
     """
     增量下载所有A股历史数据
 
@@ -154,6 +155,8 @@ def download_all_incremental(start_year: int = 2020, max_workers: int = 5,
     logger.info(f"数据源: {data_source}")
     logger.info(f"数据范围: {start_date} 至 {end_date}")
     logger.info(f"并发数: {max_workers}")
+    if force:
+        logger.info("强制模式: 跳过本地数据检查，尝试下载所有股票")
 
     # 初始化下载器
     downloader = DataDownloader()
@@ -214,13 +217,12 @@ def download_all_incremental(start_year: int = 2020, max_workers: int = 5,
         try:
             file_path = os.path.join(downloader.daily_dir, f"{stock_code}.csv")
 
-            if os.path.exists(file_path):
+            # 检查本地数据是否已经包含今天的数据 (force模式跳过此检查)
+            if not force and os.path.exists(file_path):
                 earliest, latest = get_data_date_range(file_path)
                 if earliest and latest:
-                    # 检查数据完整性和最新性
-                    expected_latest = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-                    if latest >= expected_latest:
-                        # 数据已最新
+                    # 只有当数据已经包含今天(end_date)才跳过
+                    if latest >= end_date:
                         stats['already_latest'] += 1
                         show_progress()
                         return True
@@ -233,18 +235,23 @@ def download_all_incremental(start_year: int = 2020, max_workers: int = 5,
                     time.sleep(1)
                     logger.debug(f"AkShare限流: 已下载 {download_count[0]} 只，休息1秒")
 
-            # 执行下载
+            # 记录下载前的状态
+            had_data_before = os.path.exists(file_path)
+            old_latest = None
+            if had_data_before:
+                _, old_latest = get_data_date_range(file_path)
+
+            # 执行增量下载
             if download_stock_incremental(downloader, stock_code, start_date, end_date):
                 stats['success'] += 1
 
                 # 判断是更新还是新下载
-                if os.path.exists(file_path):
-                    _, latest = get_data_date_range(file_path)
-                    expected_latest = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-                    if latest >= expected_latest:
+                if had_data_before and old_latest:
+                    _, new_latest = get_data_date_range(file_path)
+                    if new_latest and new_latest > old_latest:
                         stats['updated'] += 1
                     else:
-                        stats['new_download'] += 1
+                        stats['already_latest'] += 1
                 else:
                     stats['new_download'] += 1
 
@@ -312,6 +319,8 @@ def main():
                        help='并发下载数，AkShare建议1 (默认: 1)')
     parser.add_argument('--token', type=str, default=None,
                        help='Tushare Pro Token (也可设置环境变量TUSHARE_TOKEN)')
+    parser.add_argument('--force', action='store_true',
+                       help='强制模式: 跳过本地数据检查，尝试下载所有股票')
 
     args = parser.parse_args()
 
@@ -324,7 +333,8 @@ def main():
         start_year=args.start_year,
         max_workers=args.workers,
         data_source=args.source,
-        tushare_token=args.token
+        tushare_token=args.token,
+        force=args.force
     )
 
     return 0 if stats['failed'] < stats['success'] else 1
