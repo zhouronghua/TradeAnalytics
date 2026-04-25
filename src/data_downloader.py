@@ -35,6 +35,12 @@ try:
 except ImportError:
     TUSHARE_AVAILABLE = False
 
+try:
+    from src.data_source_tencent import TencentDataSource
+    TENCENT_AVAILABLE = True
+except ImportError:
+    TENCENT_AVAILABLE = False
+
 
 class DataDownloader:
     """数据下载器"""
@@ -71,6 +77,7 @@ class DataDownloader:
         self.data_source = self.config.get('DataSource', 'source', fallback='akshare').lower()
         self.baostock_source = None
         self.tushare_source = None
+        self.tencent_source = None
 
         if self.data_source == 'tushare':
             if not TUSHARE_AVAILABLE:
@@ -95,6 +102,12 @@ class DataDownloader:
             else:
                 self.baostock_source = BaoStockDataSource()
                 self.logger.info("使用BaoStock数据源（线程安全版本）")
+        elif self.data_source == 'akshare':
+            # 确保在 akshare 模式下不初始化 baostock
+            self.baostock_source = None
+        else:
+            # 其他模式
+            self.baostock_source = None
 
         if self.data_source == 'akshare':
             if not AKSHARE_AVAILABLE:
@@ -113,6 +126,15 @@ class DataDownloader:
                         self.logger.error(f"Tushare初始化失败: {e}")
             else:
                 self.logger.info("使用AkShare数据源")
+
+        if self.data_source == 'tencent':
+            if not TENCENT_AVAILABLE:
+                self.logger.error("腾讯数据源不可用")
+                self.logger.info("自动切换到AkShare")
+                self.data_source = 'akshare'
+            else:
+                self.tencent_source = TencentDataSource()
+                self.logger.info("使用腾讯财经数据源")
 
         self.logger.info(f"数据下载器初始化完成（数据源: {self.data_source}, 每日下载限制: {self.daily_download_limit_mb}MB）")
     
@@ -171,7 +193,15 @@ class DataDownloader:
                     available_columns = {k: v for k, v in columns_map.items() if k in stock_list.columns}
                     stock_list = stock_list[list(available_columns.keys())].copy()
                     stock_list.rename(columns=available_columns, inplace=True)
-            
+
+            elif self.data_source == 'tencent' and self.tencent_source:
+                # 使用腾讯数据源 - 从本地缓存读取股票列表
+                stock_list = self.tencent_source.get_stock_list(stock_list_file)
+                if stock_list is not None and not stock_list.empty:
+                    self.logger.info(f"从本地缓存获取股票列表: {len(stock_list)} 只")
+                else:
+                    self.logger.warning("本地股票列表缓存为空或不存在")
+
             if stock_list is None or stock_list.empty:
                 self.logger.error("获取股票列表失败")
                 # 尝试读取本地缓存
@@ -316,6 +346,17 @@ class DataDownloader:
                     else:
                         self.logger.debug(f"AkShare返回空数据 {stock_code}: df={df is None}")
 
+                elif self.data_source == 'tencent' and self.tencent_source:
+                    # 使用腾讯财经数据源
+                    self.logger.debug(f"腾讯数据源请求: {stock_code}, 日期: {start_date_fmt_std} - {end_date_fmt_std}")
+                    df = self.tencent_source.get_stock_history(
+                        stock_code=stock_code,
+                        start_date=start_date_fmt_std,
+                        end_date=end_date_fmt_std
+                    )
+                    if df is None:
+                        self.logger.debug(f"腾讯数据源返回空数据 {stock_code}")
+
                 if df is None or df.empty:
                     if attempt == self.retry_times - 1:  # 只在最后一次重试时输出警告
                         self.logger.debug(f"股票 {stock_code} 数据为空 (已重试{self.retry_times}次)")
@@ -431,11 +472,24 @@ class DataDownloader:
                 # 没有新数据或下载失败
                 return True
         else:
-            # 本地无数据，下载全部历史数据
-            df = self.download_stock_history(stock_code)
-            if df is not None:
+            # 本地无数据，下载完整历史数据（从2020年开始）
+            self.logger.info(f"股票 {stock_code} 本地无数据，下载完整历史数据（从2020年开始）...")
+
+            # 设置起始日期为2020-01-01
+            start_date = "20200101"
+            end_date = datetime.now().strftime('%Y%m%d')
+
+            df = self.download_stock_history(stock_code, start_date=start_date, end_date=end_date)
+
+            if df is not None and not df.empty:
+                self.logger.info(f"股票 {stock_code} 下载完成: {len(df)} 条数据 ({df['date'].min()} 至 {df['date'].max()})")
                 return self.save_stock_data(stock_code, df)
-            return False
+            elif df is not None and df.empty:
+                self.logger.warning(f"股票 {stock_code} 返回空数据，可能是在2020年前上市或数据不可用")
+                return False
+            else:
+                self.logger.error(f"股票 {stock_code} 下载失败")
+                return False
     
     def download_all_stocks(self, stock_list: pd.DataFrame = None,
                            callback=None) -> Tuple[int, int]:

@@ -50,6 +50,12 @@ def parse_args():
                         help='仅执行成交量暴涨分析(原有逻辑)')
     parser.add_argument('--force-non-trading', action='store_true',
                         help='非交易日也执行(默认跳过周末)')
+    parser.add_argument('--require-fresh-data', action='store_true',
+                        help='强制要求数据新鲜度（超过7天未更新则退出）')
+    parser.add_argument('--stale-days', type=int, default=7,
+                        help='数据过期天数阈值（默认7天）')
+    parser.add_argument('--clear-stale-data', action='store_true',
+                        help='数据过期超过阈值时自动清空数据目录（从头下载）')
     parser.add_argument('--config', default='config/config.ini',
                         help='配置文件路径')
     return parser.parse_args()
@@ -89,9 +95,20 @@ def download_data(config_file: str, logger) -> bool:
         return False
 
 
-def download_latest_year_data(config_file: str, logger) -> bool:
-    """下载最近一年股票数据（使用增量更新机制）"""
-    logger.info("开始下载最近一年数据...")
+def download_historical_data(config_file: str, logger, start_year: int = 2020) -> bool:
+    """
+    下载历史股票数据（默认从2020年开始）
+    使用增量更新机制，对于已有数据的股票只下载缺失的部分
+
+    Args:
+        config_file: 配置文件路径
+        logger: 日志记录器
+        start_year: 起始年份，默认2020
+
+    Returns:
+        是否成功
+    """
+    logger.info(f"开始下载历史数据（从{start_year}年至今）...")
     try:
         downloader = DataDownloader(config_file)
 
@@ -101,35 +118,69 @@ def download_latest_year_data(config_file: str, logger) -> bool:
             return False
         logger.info(f"股票列表: {len(stock_list)} 只")
 
+        # 检查本地数据情况
+        daily_dir = Config(config_file).get('Paths', 'daily_dir', fallback='./data/daily')
+        csv_files = glob.glob(os.path.join(daily_dir, '*.csv'))
+
+        if csv_files:
+            logger.info(f"本地已有 {len(csv_files)} 只股票数据，检查数据完整性...")
+            # 检查数据最早日期
+            earliest_date = None
+            for csv_file in csv_files[:50]:  # 检查前50个文件
+                try:
+                    df = pd.read_csv(csv_file, nrows=1)  # 只读第一行（最早日期）
+                    if 'date' in df.columns:
+                        file_earliest = pd.to_datetime(df['date'].iloc[0])
+                        if earliest_date is None or file_earliest < earliest_date:
+                            earliest_date = file_earliest
+                except:
+                    continue
+
+            if earliest_date:
+                logger.info(f"本地数据最早日期: {earliest_date.strftime('%Y-%m-%d')}")
+                if earliest_date.year > start_year:
+                    logger.warning(f"本地数据起始年份为 {earliest_date.year}，需要补充 {start_year} 年至 {earliest_date.year} 的历史数据")
+
         def progress(current, total, stock_code, matched):
             if current % 500 == 0:
                 logger.info(f"  下载进度: {current}/{total}")
 
-        # DataDownloader的update_stock_data会增量更新
-        # 对于新数据或过期数据，它会自动下载最近的数据
+        # 对于没有本地数据的股票，下载完整历史数据
+        # 对于有本地数据的股票，增量更新
         success, fail = downloader.download_all_stocks(
             stock_list, callback=progress)
-        logger.info(f"最近一年数据下载完成: 成功{success}, 失败{fail}")
+        logger.info(f"历史数据下载完成: 成功{success}, 失败{fail}")
         return True
 
     except Exception as e:
-        logger.error(f"最近一年数据下载失败: {e}")
+        logger.error(f"历史数据下载失败: {e}")
         return False
 
 
-def check_data_freshness(config_file: str, logger) -> tuple[bool, str]:
+# 保留旧函数名以兼容现有代码
+def download_latest_year_data(config_file: str, logger) -> bool:
+    """下载最近一年股票数据（使用增量更新机制）"""
+    return download_historical_data(config_file, logger, start_year=2020)
+
+
+def check_data_freshness(config_file: str, logger, stale_days: int = 7) -> tuple[bool, str, int]:
     """
     检查数据新鲜度
 
+    Args:
+        config_file: 配置文件路径
+        logger: 日志记录器
+        stale_days: 数据过期天数阈值
+
     Returns:
-        (是否最新, 状态信息)
+        (是否最新, 状态信息, 距离今天的天数)
     """
     config = Config(config_file)
     daily_dir = config.get('Paths', 'daily_dir', fallback='./data/daily')
 
     csv_files = glob.glob(os.path.join(daily_dir, '*.csv'))
     if not csv_files:
-        return False, "本地无数据文件"
+        return False, "本地无数据文件", -1
 
     # 检查所有CSV文件中的最新日期
     latest_date = None
@@ -151,7 +202,7 @@ def check_data_freshness(config_file: str, logger) -> tuple[bool, str]:
             continue
 
     if latest_date is None:
-        return False, f"无法从 {checked_files} 个文件中提取日期"
+        return False, f"无法从 {checked_files} 个文件中提取日期", -1
 
     today = datetime.now()
     days_diff = (today - latest_date).days
@@ -160,12 +211,126 @@ def check_data_freshness(config_file: str, logger) -> tuple[bool, str]:
     one_year_ago = today - timedelta(days=365)
 
     if latest_date < one_year_ago:
-        return False, f"数据已过期: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距今天 {days_diff} 天，缺少最近一年数据"
+        return False, f"数据已过期: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距今天 {days_diff} 天，缺少最近一年数据", days_diff
 
-    if days_diff > 7:
-        return False, f"数据不够新: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距今天 {days_diff} 天"
+    if days_diff > stale_days:
+        return False, f"数据不够新: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距今天 {days_diff} 天", days_diff
 
-    return True, f"数据较新: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距今天 {days_diff} 天"
+    return True, f"数据较新: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距今天 {days_diff} 天", days_diff
+
+
+def clear_stale_data(config_file: str, logger, stale_days: int = 7) -> bool:
+    """
+    清理过期数据
+    当数据超过指定天数未更新时，清空数据目录以便重新下载
+
+    Args:
+        config_file: 配置文件路径
+        logger: 日志记录器
+        stale_days: 数据过期天数阈值
+
+    Returns:
+        是否执行了清理操作
+    """
+    config = Config(config_file)
+    daily_dir = config.get('Paths', 'daily_dir', fallback='./data/daily')
+
+    # 检查数据新鲜度
+    is_fresh, status_msg, days_diff = check_data_freshness(config_file, logger, stale_days)
+
+    if not is_fresh and days_diff > stale_days:
+        logger.warning(f"数据已过期 {days_diff} 天，超过阈值 {stale_days} 天，准备清空数据目录")
+        logger.warning(f"清理目录: {daily_dir}")
+
+        try:
+            csv_files = glob.glob(os.path.join(daily_dir, '*.csv'))
+            if csv_files:
+                for csv_file in csv_files:
+                    try:
+                        os.remove(csv_file)
+                        logger.debug(f"删除文件: {csv_file}")
+                    except Exception as e:
+                        logger.warning(f"删除文件失败 {csv_file}: {e}")
+                logger.info(f"已清空 {len(csv_files)} 个过期数据文件")
+            else:
+                logger.info("数据目录为空，无需清理")
+            return True
+        except Exception as e:
+            logger.error(f"清理数据目录失败: {e}")
+            return False
+    else:
+        logger.debug(f"数据未过期（{days_diff} 天），无需清理")
+        return False
+
+
+def mark_new_stocks(current_df: pd.DataFrame, results_dir: str, logger) -> pd.DataFrame:
+    """
+    标记新增的股票
+    对比前一天的结果文件，标记出当天新增的股票
+
+    Args:
+        current_df: 当前分析结果DataFrame
+        results_dir: 结果文件目录
+        logger: 日志记录器
+
+    Returns:
+        添加了'is_new'标记的DataFrame
+    """
+    if current_df is None or current_df.empty:
+        return current_df
+
+    # 确保有stock_code列
+    if 'stock_code' not in current_df.columns:
+        logger.debug("当前结果无stock_code列，无法标记新增股票")
+        return current_df
+
+    # 查找前一天的结果文件
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y%m%d')
+    yesterday_files = glob.glob(os.path.join(results_dir, f'monster_stock_{yesterday}_*.csv'))
+
+    # 如果找不到昨天文件，尝试找最近的文件
+    if not yesterday_files:
+        all_files = glob.glob(os.path.join(results_dir, 'monster_stock_*.csv'))
+        if all_files:
+            # 按修改时间排序，取最近的一个（排除今天）
+            today_str = datetime.now().strftime('%Y%m%d')
+            recent_files = [f for f in all_files if not os.path.basename(f).startswith(f'monster_stock_{today_str}')]
+            if recent_files:
+                recent_files.sort(key=os.path.getmtime, reverse=True)
+                yesterday_files = [recent_files[0]]
+
+    if not yesterday_files:
+        logger.info("未找到前一天的结果文件，所有股票标记为新增")
+        current_df['is_new'] = True
+        current_df['标记'] = '【新】'
+        return current_df
+
+    try:
+        # 读取前一天的结果
+        prev_df = pd.read_csv(yesterday_files[0], dtype={'stock_code': str})
+        if prev_df is None or prev_df.empty or 'stock_code' not in prev_df.columns:
+            logger.warning("前一天结果文件为空或格式错误")
+            current_df['is_new'] = True
+            current_df['标记'] = '【新】'
+            return current_df
+
+        prev_codes = set(prev_df['stock_code'].astype(str).tolist())
+        current_df['is_new'] = ~current_df['stock_code'].astype(str).isin(prev_codes)
+
+        # 添加标记列用于显示
+        current_df['标记'] = current_df['is_new'].apply(lambda x: '【新】' if x else '')
+
+        new_count = current_df['is_new'].sum()
+        total_count = len(current_df)
+        logger.info(f"对比前一天结果: 共 {total_count} 只，新增 {new_count} 只，持续 {total_count - new_count} 只")
+
+        return current_df
+
+    except Exception as e:
+        logger.warning(f"读取前一天结果文件失败: {e}")
+        current_df['is_new'] = True
+        current_df['标记'] = '【新】'
+        return current_df
 
 
 def run_monster_analysis(config_file: str, logger):
@@ -180,6 +345,11 @@ def run_monster_analysis(config_file: str, logger):
             logger.info(f"  {message}")
 
     results_df, output_file = analyzer.run(daily_dir, results_dir, progress)
+
+    # 标记新增股票
+    if results_df is not None and not results_df.empty:
+        results_df = mark_new_stocks(results_df, results_dir, logger)
+
     return results_df, output_file
 
 
@@ -242,23 +412,63 @@ def main():
         if csv_count == 0:
             logger.info("本地无数据，需要先下载")
             if not download_latest_year_data(args.config, logger):
-                logger.error("数据下载失败，退出")
-                sys.exit(1)
+                if args.require_fresh_data:
+                    logger.error("数据下载失败且启用了强制新鲜数据模式，退出")
+                    sys.exit(1)
+                else:
+                    logger.warning("数据下载失败，但将继续尝试使用现有数据")
         else:
             # 检查数据新鲜度
             logger.info(f"本地已有 {csv_count} 只股票数据，检查数据新鲜度...")
-            is_fresh, status_msg = check_data_freshness(args.config, logger)
+            is_fresh, status_msg, days_diff = check_data_freshness(args.config, logger, args.stale_days)
             logger.info(f"  {status_msg}")
 
             if not is_fresh:
-                logger.info("数据不够新，开始下载最近一年数据...")
-                if not download_latest_year_data(args.config, logger):
-                    logger.warning("最近一年数据下载失败，将尝试使用现有数据继续")
+                # 如果启用了清理过期数据模式，且数据过期超过阈值，清空数据目录
+                if args.clear_stale_data and days_diff > args.stale_days:
+                    logger.warning(f"数据已过期 {days_diff} 天，超过阈值 {args.stale_days} 天")
+                    logger.warning("启用自动清理过期数据模式，准备清空数据目录")
+                    if clear_stale_data(args.config, logger, args.stale_days):
+                        logger.info("数据目录已清空，准备重新下载全部数据")
+                        # 清空后重新下载全部数据
+                        if not download_latest_year_data(args.config, logger):
+                            logger.error("数据重新下载失败")
+                            if args.require_fresh_data:
+                                logger.error("强制新鲜数据模式下，退出程序")
+                                sys.exit(1)
+                    else:
+                        logger.error("清理数据目录失败")
+                        if args.require_fresh_data:
+                            sys.exit(1)
+                # 如果启用了强制新鲜数据模式且数据过期超过阈值，退出程序
+                elif args.require_fresh_data and days_diff > args.stale_days:
+                    logger.error(f"数据已过期 {days_diff} 天，超过阈值 {args.stale_days} 天，退出")
+                    logger.error("请检查数据源连接或手动更新数据")
+                    sys.exit(1)
+                else:
+                    logger.info("数据不够新，开始下载最近一年数据...")
+                    if not download_latest_year_data(args.config, logger):
+                        if args.require_fresh_data:
+                            logger.error("数据下载失败且启用了强制新鲜数据模式，退出")
+                            sys.exit(1)
+                        else:
+                            logger.warning("最近一年数据下载失败，将尝试使用现有数据继续")
             else:
                 logger.info("数据较新，尝试增量更新...")
                 download_data(args.config, logger)
     else:
         logger.info("跳过数据下载（--skip-download）")
+
+        # 即使跳过下载，如果启用了强制新鲜数据模式，仍需检查数据新鲜度
+        if args.require_fresh_data:
+            logger.info("检查本地数据新鲜度（--require-fresh-data 已启用）...")
+            is_fresh, status_msg, days_diff = check_data_freshness(args.config, logger, args.stale_days)
+            logger.info(f"  {status_msg}")
+
+            if not is_fresh and days_diff > args.stale_days:
+                logger.error(f"本地数据已过期 {days_diff} 天，超过阈值 {args.stale_days} 天")
+                logger.error("数据过期且无法更新（--skip-download），退出")
+                sys.exit(1)
 
     # 步骤2: 分析
     if args.volume_only:
@@ -270,11 +480,21 @@ def main():
 
     # 步骤3: 输出结果摘要
     if results_df is not None and not results_df.empty:
-        print(f"\n发现 {len(results_df)} 只候选股:")
+        # 统计新增股票数量
+        new_count = 0
+        if 'is_new' in results_df.columns:
+            new_count = results_df['is_new'].sum()
+
+        print(f"\n发现 {len(results_df)} 只候选股" + (f"（其中新增 {new_count} 只）" if new_count > 0 else "") + ":")
         print("-" * 80)
+
+        # 构建显示列，如果有标记列则包含
         display_cols = ['stock_code', 'stock_name', 'close', 'change_pct',
                         'volume_ratio', 'total_score', 'consecutive_limits']
+        if '标记' in results_df.columns:
+            display_cols.insert(0, '标记')
         display_cols = [c for c in display_cols if c in results_df.columns]
+
         print(results_df[display_cols].head(20).to_string(index=False))
         print("-" * 80)
         if output_file:

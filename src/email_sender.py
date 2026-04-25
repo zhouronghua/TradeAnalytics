@@ -86,6 +86,11 @@ class EmailSender:
 
     def _build_monster_stock_html(self, df: pd.DataFrame, date: str) -> str:
         """构建妖股报告HTML邮件"""
+        # 统计新增股票数量
+        new_count = 0
+        if 'is_new' in df.columns:
+            new_count = df['is_new'].sum()
+
         rows_html = ""
         for i, (_, row) in enumerate(df.iterrows()):
             if i >= 30:
@@ -115,10 +120,24 @@ class EmailSender:
             score_color = '#e74c3c' if score >= 60 else '#e67e22' if score >= 45 else '#2ecc71'
             chg_color = '#e74c3c' if chg > 0 else '#27ae60' if chg < 0 else '#333'
 
+            # 检查是否是新增股票
+            new_badge = ""
+            is_new_stock = False
+            if '标记' in row and row['标记']:
+                is_new_stock = True
+                new_badge = '<span style="background:#e74c3c;color:#fff;padding:2px 6px;border-radius:3px;font-size:11px;margin-right:4px;">新</span>'
+            elif 'is_new' in row and row['is_new']:
+                is_new_stock = True
+                new_badge = '<span style="background:#e74c3c;color:#fff;padding:2px 6px;border-radius:3px;font-size:11px;margin-right:4px;">新</span>'
+
+            # 如果是新增股票，高亮显示
+            if is_new_stock:
+                bg = '#ffebee'  # 浅红色背景
+
             rows_html += f"""
             <tr style="background:{bg};">
                 <td style="padding:6px 8px;text-align:center;">{i+1}</td>
-                <td style="padding:6px 8px;">{code}</td>
+                <td style="padding:6px 8px;">{new_badge}{code}</td>
                 <td style="padding:6px 8px;">{name}</td>
                 <td style="padding:6px 8px;text-align:right;">{close:.2f}</td>
                 <td style="padding:6px 8px;text-align:right;color:{chg_color};">{chg:+.2f}%</td>
@@ -130,6 +149,9 @@ class EmailSender:
                 <td style="padding:6px 8px;font-size:12px;color:#555;">{reason_text}</td>
             </tr>"""
 
+        # 标题后缀显示新增数量
+        new_suffix = f"（新增 {new_count} 只）" if new_count > 0 else ""
+
         html = f"""
         <html>
         <head><meta charset="utf-8"></head>
@@ -137,14 +159,15 @@ class EmailSender:
         <div style="max-width:1100px;margin:0 auto;background:#fff;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
             <div style="background:linear-gradient(135deg,#e74c3c,#c0392b);padding:20px 30px;border-radius:8px 8px 0 0;">
                 <h1 style="color:#fff;margin:0;font-size:22px;">妖股筛选报告</h1>
-                <p style="color:#ffd;margin:5px 0 0 0;font-size:14px;">{date} | 发现 {len(df)} 只候选股</p>
+                <p style="color:#ffd;margin:5px 0 0 0;font-size:14px;">{date} | 发现 {len(df)} 只候选股{new_suffix}</p>
             </div>
 
             <div style="padding:20px 30px;">
                 <h3 style="color:#333;border-bottom:2px solid #e74c3c;padding-bottom:8px;">评分维度说明</h3>
                 <p style="color:#666;font-size:13px;line-height:1.8;">
                     综合评分 = 量能(0-25) + 涨停(0-25) + 形态(0-20) + 技术(0-20) + 换手(0-10)，满分100<br>
-                    分项栏格式: 量能分/涨停分/形态分/技术分
+                    分项栏格式: 量能分/涨停分/形态分/技术分<br>
+                    <span style="color:#e74c3c;font-weight:bold;">标记"新"的为当日新增候选股</span>
                 </p>
 
                 <div style="overflow-x:auto;">
@@ -184,9 +207,15 @@ class EmailSender:
     def _monster_df_to_markdown(self, df: pd.DataFrame, date: str) -> str:
         """妖股结果转为 Server 酱可用的纯文本/Markdown 摘要"""
         max_rows = self.config.getint('Notification', 'push_max_stocks', fallback=20)
+
+        # 统计新增股票数量
+        new_count = 0
+        if 'is_new' in df.columns:
+            new_count = df['is_new'].sum()
+
         lines = [
             f"分析日期: {date}",
-            f"候选数量: {len(df)}",
+            f"候选数量: {len(df)}" + (f"（新增 {new_count} 只）" if new_count > 0 else ""),
             "",
         ]
         _g = self._get_field
@@ -194,6 +223,13 @@ class EmailSender:
             if i >= max_rows:
                 lines.append(f"... 其余 {len(df) - max_rows} 只略，详见本地结果 CSV")
                 break
+            # 检查是否有新增标记
+            new_mark = ""
+            if '标记' in row and row['标记']:
+                new_mark = str(row['标记']) + " "
+            elif 'is_new' in row and row['is_new']:
+                new_mark = "【新】 "
+
             code = str(_g(row, 'stock_code', '股票代码', '')).zfill(6)
             name = _g(row, 'stock_name', '股票名称', code)
             score = int(_g(row, 'total_score', '综合评分'))
@@ -202,7 +238,7 @@ class EmailSender:
             reasons = self._generate_reasons(row)
             reason_text = "; ".join(reasons) if reasons else "-"
             lines.append(
-                f"- {code} {name} 收盘{close:.2f} {chg:+.2f}% 综合分{score} | {reason_text}"
+                f"- {new_mark}{code} {name} 收盘{close:.2f} {chg:+.2f}% 综合分{score} | {reason_text}"
             )
         lines.append("")
         lines.append(

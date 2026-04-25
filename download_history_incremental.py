@@ -160,7 +160,19 @@ def download_all_incremental(start_year: int = 2020, max_workers: int = 5,
 
     # 初始化下载器
     downloader = DataDownloader()
+    
+    # 强制使用命令行指定的 source，覆盖 DataDownloader 内部从 config.ini 读取的逻辑
     downloader.data_source = data_source
+    if data_source == 'baostock':
+        from src.data_source_baostock_threadsafe import ThreadSafeBaoStockDataSource as BaoStockDataSource
+        downloader.baostock_source = BaoStockDataSource()
+        logger.info("强制切换到 BaoStock 数据源")
+    elif data_source == 'akshare':
+        downloader.baostock_source = None # 确保不使用 baostock
+        logger.info("强制切换到 AkShare 数据源")
+    elif data_source == 'tushare':
+        downloader.baostock_source = None
+        logger.info("强制切换到 Tushare 数据源")
 
     # 配置Tushare
     if data_source == 'tushare':
