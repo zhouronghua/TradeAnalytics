@@ -26,7 +26,7 @@ if sys.version_info[0] < 3:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.utils import setup_logger, Config, is_trading_day
+from src.utils import setup_logger, Config, is_trading_day, get_last_trading_day, get_last_trading_day_str
 from src.data_downloader import DataDownloader
 from src.monster_stock_analyzer import MonsterStockAnalyzer
 from src.volume_analyzer import analyze_volume_surge
@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument('--volume-only', action='store_true',
                         help='仅执行成交量暴涨分析(原有逻辑)')
     parser.add_argument('--force-non-trading', action='store_true',
-                        help='非交易日也执行(默认跳过周末)')
+                        help='已弃用，非交易日默认也会执行（自动使用最近交易日数据）')
     parser.add_argument('--require-fresh-data', action='store_true',
                         help='强制要求数据新鲜度（超过7天未更新则退出）')
     parser.add_argument('--stale-days', type=int, default=7,
@@ -163,7 +163,7 @@ def download_latest_year_data(config_file: str, logger) -> bool:
     return download_historical_data(config_file, logger, start_year=2020)
 
 
-def check_data_freshness(config_file: str, logger, stale_days: int = 7) -> tuple[bool, str, int]:
+def check_data_freshness(config_file: str, logger, stale_days: int = 7, reference_date: datetime = None) -> tuple[bool, str, int]:
     """
     检查数据新鲜度
 
@@ -171,10 +171,14 @@ def check_data_freshness(config_file: str, logger, stale_days: int = 7) -> tuple
         config_file: 配置文件路径
         logger: 日志记录器
         stale_days: 数据过期天数阈值
+        reference_date: 参考日期（用于判断数据是否更新到该日期），默认为今天
 
     Returns:
-        (是否最新, 状态信息, 距离今天的天数)
+        (是否最新, 状态信息, 距离参考日期的天数)
     """
+    if reference_date is None:
+        reference_date = datetime.now()
+
     config = Config(config_file)
     daily_dir = config.get('Paths', 'daily_dir', fallback='./data/daily')
 
@@ -204,22 +208,23 @@ def check_data_freshness(config_file: str, logger, stale_days: int = 7) -> tuple
     if latest_date is None:
         return False, f"无法从 {checked_files} 个文件中提取日期", -1
 
-    today = datetime.now()
-    days_diff = (today - latest_date).days
+    days_diff = (reference_date - latest_date).days
 
     # 计算一年前日期
-    one_year_ago = today - timedelta(days=365)
+    one_year_ago = reference_date - timedelta(days=365)
+
+    ref_date_str = reference_date.strftime('%Y-%m-%d')
 
     if latest_date < one_year_ago:
-        return False, f"数据已过期: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距今天 {days_diff} 天，缺少最近一年数据", days_diff
+        return False, f"数据已过期: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距参考日期 {ref_date_str} {days_diff} 天，缺少最近一年数据", days_diff
 
     if days_diff > stale_days:
-        return False, f"数据不够新: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距今天 {days_diff} 天", days_diff
+        return False, f"数据不够新: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距参考日期 {ref_date_str} {days_diff} 天", days_diff
 
-    return True, f"数据较新: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距今天 {days_diff} 天", days_diff
+    return True, f"数据较新: 最新日期 {latest_date.strftime('%Y-%m-%d')}，距参考日期 {ref_date_str} {days_diff} 天", days_diff
 
 
-def clear_stale_data(config_file: str, logger, stale_days: int = 7) -> bool:
+def clear_stale_data(config_file: str, logger, stale_days: int = 7, reference_date: datetime = None) -> bool:
     """
     清理过期数据
     当数据超过指定天数未更新时，清空数据目录以便重新下载
@@ -228,15 +233,19 @@ def clear_stale_data(config_file: str, logger, stale_days: int = 7) -> bool:
         config_file: 配置文件路径
         logger: 日志记录器
         stale_days: 数据过期天数阈值
+        reference_date: 参考日期，默认为今天
 
     Returns:
         是否执行了清理操作
     """
+    if reference_date is None:
+        reference_date = datetime.now()
+
     config = Config(config_file)
     daily_dir = config.get('Paths', 'daily_dir', fallback='./data/daily')
 
     # 检查数据新鲜度
-    is_fresh, status_msg, days_diff = check_data_freshness(config_file, logger, stale_days)
+    is_fresh, status_msg, days_diff = check_data_freshness(config_file, logger, stale_days, reference_date)
 
     if not is_fresh and days_diff > stale_days:
         logger.warning(f"数据已过期 {days_diff} 天，超过阈值 {stale_days} 天，准备清空数据目录")
@@ -399,12 +408,16 @@ def main():
             print("[FAIL] 发送失败，请检查 config.ini 中 [Notification] serverchan_key")
         return
 
-    # 交易日检查
-    if not args.force_non_trading and not is_trading_day(datetime.now()):
-        logger.info("今天不是交易日，跳过分析 (使用 --force-non-trading 可强制执行)")
-        return
+    # 确定分析日期（如果是非交易日，使用最近一个交易日）
+    today = datetime.now()
+    if not is_trading_day(today):
+        analysis_date = get_last_trading_day(today)
+        logger.info(f"今天不是交易日 ({today.strftime('%Y-%m-%d')})，将分析最近交易日: {analysis_date.strftime('%Y-%m-%d')}")
+    else:
+        analysis_date = today
+        logger.info(f"今天是交易日: {analysis_date.strftime('%Y-%m-%d')}")
 
-    # 步骤1: 检查并确保数据最新
+    # 步骤1: 检查并确保数据最新（数据截止到最近交易日）
     if not args.skip_download:
         daily_dir = Config(args.config).get('Paths', 'daily_dir', fallback='./data/daily')
         csv_count = len(glob.glob(os.path.join(daily_dir, '*.csv')))
@@ -418,9 +431,9 @@ def main():
                 else:
                     logger.warning("数据下载失败，但将继续尝试使用现有数据")
         else:
-            # 检查数据新鲜度
-            logger.info(f"本地已有 {csv_count} 只股票数据，检查数据新鲜度...")
-            is_fresh, status_msg, days_diff = check_data_freshness(args.config, logger, args.stale_days)
+            # 检查数据新鲜度（以analysis_date为参考日期）
+            logger.info(f"本地已有 {csv_count} 只股票数据，检查数据新鲜度（参考日期: {analysis_date.strftime('%Y-%m-%d')}）...")
+            is_fresh, status_msg, days_diff = check_data_freshness(args.config, logger, args.stale_days, analysis_date)
             logger.info(f"  {status_msg}")
 
             if not is_fresh:
@@ -428,7 +441,7 @@ def main():
                 if args.clear_stale_data and days_diff > args.stale_days:
                     logger.warning(f"数据已过期 {days_diff} 天，超过阈值 {args.stale_days} 天")
                     logger.warning("启用自动清理过期数据模式，准备清空数据目录")
-                    if clear_stale_data(args.config, logger, args.stale_days):
+                    if clear_stale_data(args.config, logger, args.stale_days, analysis_date):
                         logger.info("数据目录已清空，准备重新下载全部数据")
                         # 清空后重新下载全部数据
                         if not download_latest_year_data(args.config, logger):
@@ -446,13 +459,13 @@ def main():
                     logger.error("请检查数据源连接或手动更新数据")
                     sys.exit(1)
                 else:
-                    logger.info("数据不够新，开始下载最近一年数据...")
+                    logger.info("数据不够新，开始下载历史数据...")
                     if not download_latest_year_data(args.config, logger):
                         if args.require_fresh_data:
                             logger.error("数据下载失败且启用了强制新鲜数据模式，退出")
                             sys.exit(1)
                         else:
-                            logger.warning("最近一年数据下载失败，将尝试使用现有数据继续")
+                            logger.warning("历史数据下载失败，将尝试使用现有数据继续")
             else:
                 logger.info("数据较新，尝试增量更新...")
                 download_data(args.config, logger)
@@ -461,8 +474,8 @@ def main():
 
         # 即使跳过下载，如果启用了强制新鲜数据模式，仍需检查数据新鲜度
         if args.require_fresh_data:
-            logger.info("检查本地数据新鲜度（--require-fresh-data 已启用）...")
-            is_fresh, status_msg, days_diff = check_data_freshness(args.config, logger, args.stale_days)
+            logger.info(f"检查本地数据新鲜度（参考日期: {analysis_date.strftime('%Y-%m-%d')}，--require-fresh-data 已启用）...")
+            is_fresh, status_msg, days_diff = check_data_freshness(args.config, logger, args.stale_days, analysis_date)
             logger.info(f"  {status_msg}")
 
             if not is_fresh and days_diff > args.stale_days:
@@ -503,27 +516,29 @@ def main():
         print("\n未发现符合条件的候选股")
 
     # 步骤4: 推送（邮件 + Server酱同时尝试，互不影响）
+    # 使用analysis_date作为推送日期（非交易日时为最近交易日）
+    analysis_date_str = analysis_date.strftime('%Y-%m-%d')
+
     skip_push = args.no_push or args.no_email
     if not skip_push:
-        today = datetime.now().strftime('%Y-%m-%d')
         email_sender = EmailSender(args.config)
         notifier = NotificationService(args.config)
-        
+
         if args.volume_only:
             logger.info("--- Server酱 推送(成交量分析) ---")
             if results_df is not None and not results_df.empty:
-                title = f"[量暴] {today} {len(results_df)} 只"
+                title = f"[量暴] {analysis_date_str} {len(results_df)} 只"
                 preview = results_df.head(
                     notifier.config.getint('Notification', 'push_max_stocks', fallback=20)
                 ).to_string(index=False)
                 body = (
-                    f"分析日期: {today}\n"
+                    f"分析日期: {analysis_date_str}\n"
                     f"结果文件: {output_file or '(未写入路径)'}\n\n"
                     f"{preview}"
                 )
                 ok = notifier.send_serverchan_fallback(title, body)
             else:
-                title = f"[量暴] {today} 无标的"
+                title = f"[量暴] {analysis_date_str} 无标的"
                 body = "本次成交量暴涨分析未发现符合条件的股票。"
                 ok = notifier.send_serverchan_fallback(title, body)
             if ok:
@@ -535,21 +550,21 @@ def main():
             # 尝试邮件推送（失败不阻塞Server酱）
             email_ok = False
             try:
-                email_ok = email_sender.send_monster_stock_report(results_df, today)
+                email_ok = email_sender.send_monster_stock_report(results_df, analysis_date_str)
                 if email_ok:
                     print("[OK] 分析报告已通过邮件发送")
             except Exception as e:
                 logger.warning(f"邮件推送失败(忽略): {e}")
-            
+
             # 尝试Server酱推送（失败不阻塞邮件）
             serverchan_ok = False
             try:
-                serverchan_ok = notifier.send_monster_stock_report_serverchan(results_df, today)
+                serverchan_ok = notifier.send_monster_stock_report_serverchan(results_df, analysis_date_str)
                 if serverchan_ok:
                     print("[OK] 分析报告已通过 Server酱 发送")
             except Exception as e:
                 logger.warning(f"Server酱推送失败(忽略): {e}")
-            
+
             # 汇总结果
             if not email_ok and not serverchan_ok:
                 print("[FAIL] 邮件和 Server酱 都发送失败")

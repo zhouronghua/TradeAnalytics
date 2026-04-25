@@ -187,6 +187,49 @@ def get_recent_trading_days(n: int = 2) -> List[str]:
     return list(reversed(trading_days))
 
 
+def get_last_trading_day(reference_date: datetime = None) -> datetime:
+    """
+    获取参考日期前的最后一个交易日
+    
+    Args:
+        reference_date: 参考日期，默认为今天
+        
+    Returns:
+        最后一个交易日的datetime对象
+    """
+    if reference_date is None:
+        reference_date = datetime.now()
+    
+    # 从今天往前找，直到找到交易日
+    check_date = reference_date
+    max_days_back = 10  # 最多往前找10天（应对长假）
+    days_checked = 0
+    
+    while days_checked < max_days_back:
+        if is_trading_day(check_date):
+            return check_date
+        check_date -= timedelta(days=1)
+        days_checked += 1
+    
+    # 如果10天内都没找到，返回参考日期（理论上不会发生）
+    return reference_date
+
+
+def get_last_trading_day_str(reference_date: datetime = None, fmt: str = '%Y-%m-%d') -> str:
+    """
+    获取参考日期前的最后一个交易日字符串
+    
+    Args:
+        reference_date: 参考日期，默认为今天
+        fmt: 日期格式
+        
+    Returns:
+        最后一个交易日的日期字符串
+    """
+    last_trading = get_last_trading_day(reference_date)
+    return last_trading.strftime(fmt)
+
+
 def format_date(date_str: str, input_format: str = '%Y%m%d', output_format: str = '%Y-%m-%d') -> str:
     """
     日期格式转换

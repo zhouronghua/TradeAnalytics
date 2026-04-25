@@ -1,12 +1,20 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-选股策略回测测试
-验证放量+均线策略在2020年以来A股市场的表现
+选股策略回测脚本
 
-主要功能：
-1. 按时间顺序逐日检查选股条件
-2. 记录符合条件的买入点
-3. 计算后续持有N天的收益率
-4. 统计获利概率和收益分布
+回测逻辑：
+1. 读取历史选股结果（monster_stock_*.csv）
+2. 对于每只股票，确定买入日期（选股后第一个非秒板交易日）
+3. 计算持有5天、10天、20天的收益率
+4. 统计胜率和平均收益
+
+买入规则：
+- 选股后下一个交易日开盘价买入
+- 如果当天秒板（开盘价涨幅>=9.8%），则延后一天，直到非秒板日买入
+
+卖出规则：
+- 持有5天/10天/20天后收盘价卖出
 """
 
 import os
@@ -15,540 +23,367 @@ import glob
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
-from collections import defaultdict
+from typing import Dict, List, Tuple, Optional
+import re
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from src.utils import setup_logger, safe_read_csv, ensure_dir
-from src.data_analyzer import DataAnalyzer
-from src.volume_analyzer import get_stock_name
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from src.utils import setup_logger, safe_read_csv
 
 
 class StrategyBacktest:
     """选股策略回测器"""
 
-    def __init__(self,
-                 daily_dir: str = './data/daily',
-                 start_date: str = '2020-01-01',
-                 end_date: str = None,
-                 ma_period: int = 120,
-                 volume_ratio_threshold: float = 5.0,
-                 hold_days: int = 5):
-        """
-        初始化回测器
+    # 涨停判定阈值
+    LIMIT_UP_PCT = 9.8
+    LIMIT_UP_PCT_ST = 4.8
 
-        Args:
-            daily_dir: 日K数据目录
-            start_date: 回测开始日期 'YYYY-MM-DD'
-            end_date: 回测结束日期，默认到今天
-            ma_period: 移动平均线周期
-            volume_ratio_threshold: 成交量倍数阈值
-            hold_days: 默认持有天数
-        """
-        self.daily_dir = daily_dir
-        self.start_date = pd.to_datetime(start_date)
-        self.end_date = pd.to_datetime(end_date) if end_date else pd.to_datetime(datetime.now())
-        self.ma_period = ma_period
-        self.volume_ratio_threshold = volume_ratio_threshold
-        self.hold_days = hold_days
+    # 持有天数选项
+    HOLD_DAYS = [5, 10, 20]
 
+    def __init__(self, daily_dir: str = 'data/daily', results_dir: str = 'data/results'):
         self.logger = setup_logger('StrategyBacktest')
-        self.analyzer = DataAnalyzer(ma_period=ma_period)
+        self.daily_dir = daily_dir
+        self.results_dir = results_dir
 
-        # 回测结果
-        self.trades = []  # 所有交易记录
-        self.signals = []  # 所有信号记录
-
-        ensure_dir('./build')
-
-    def load_all_stock_data(self) -> Dict[str, pd.DataFrame]:
-        """加载所有股票的历史数据"""
-        stock_data = {}
-        csv_files = glob.glob(os.path.join(self.daily_dir, '*.csv'))
-
-        self.logger.info(f"开始加载 {len(csv_files)} 只股票数据...")
-        self.logger.info(f"要求MA周期: {self.ma_period}")
-
-        skipped_count = 0
-        for i, file_path in enumerate(csv_files):
-            stock_code = os.path.basename(file_path).replace('.csv', '')
-            try:
-                df = safe_read_csv(file_path, dtype={'code': str})
-                if df is None or len(df) < 10:  # 至少需要10条数据
-                    skipped_count += 1
-                    continue
-
-                # 转换日期
-                df['date'] = pd.to_datetime(df['date'])
-
-                # 查看实际数据日期范围
-                actual_start = df['date'].min()
-                actual_end = df['date'].max()
-
-                # 筛选日期范围
-                df_filtered = df[(df['date'] >= self.start_date) & (df['date'] <= self.end_date)]
-
-                if len(df_filtered) < 10:
-                    skipped_count += 1
-                    if i == 0:  # 打印一个样本查看日期
-                        self.logger.info(f"样本数据 {stock_code} 日期范围: {actual_start} ~ {actual_end}, 筛选后: {len(df_filtered)} 条")
-                    continue
-
-                df = df_filtered
-
-                # 确保数值类型正确
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-                # 按日期排序
-                df = df.sort_values('date').reset_index(drop=True)
-
-                if len(df) < self.ma_period + 5:
-                    skipped_count += 1
-                    continue
-
-                df = self.analyzer.analyze_stock(df, ma_period=self.ma_period)
-
-                if df is not None and len(df) > 0:
-                    stock_data[stock_code] = df
-
-                if (i + 1) % 1000 == 0:
-                    self.logger.info(f"已处理 {i + 1}/{len(csv_files)} 只, 成功 {len(stock_data)} 只, 跳过 {skipped_count} 只")
-
-            except Exception as e:
-                self.logger.error(f"加载 {stock_code} 数据失败: {e}")
-
-        self.logger.info(f"成功加载 {len(stock_data)} 只股票的回测数据, 跳过 {skipped_count} 只")
-        return stock_data
-
-    def check_buy_signal(self, df: pd.DataFrame, idx: int) -> Tuple[bool, Optional[Dict]]:
+    def parse_result_date(self, filename: str) -> Optional[str]:
         """
-        检查特定日期是否符合买入条件
+        从结果文件名解析日期
+        格式: monster_stock_YYYYMMDD_HHMMSS.csv
+        """
+        match = re.search(r'monster_stock_(\d{8})_', filename)
+        if match:
+            return match.group(1)
+        return None
 
-        条件：
-        1. 成交量倍数 >= threshold
-        2. 收盘价 >= MA均线
+    def get_next_trading_date(self, date_str: str) -> str:
+        """
+        获取下一个交易日（简单实现，跳过周末）
+        """
+        date = datetime.strptime(date_str, '%Y%m%d')
+        next_date = date + timedelta(days=1)
+
+        # 跳过周末
+        while next_date.weekday() >= 5:  # 5=周六, 6=周日
+            next_date += timedelta(days=1)
+
+        return next_date.strftime('%Y-%m-%d')
+
+    def is_limit_up_open(self, open_price: float, prev_close: float, is_st: bool = False) -> bool:
+        """
+        判断是否秒板（开盘涨停）
+        """
+        if prev_close <= 0:
+            return False
+
+        pct_change = (open_price - prev_close) / prev_close * 100
+        threshold = self.LIMIT_UP_PCT_ST if is_st else self.LIMIT_UP_PCT
+
+        return pct_change >= threshold
+
+    def find_buy_date(self, stock_code: str, select_date: str) -> Tuple[Optional[str], Optional[float], str]:
+        """
+        确定买入日期和价格
 
         Args:
-            df: 股票数据DataFrame（已计算指标）
-            idx: 当前检查的数据索引
+            stock_code: 股票代码
+            select_date: 选股日期 (YYYYMMDD)
 
         Returns:
-            (是否触发信号, 信号详情)
+            (买入日期, 买入价格, 买入原因)
+        买入原因: '正常买入', '秒板延后', '数据不足'
         """
-        if idx < 0 or idx >= len(df):
-            return False, None
+        file_path = os.path.join(self.daily_dir, f'{stock_code}.csv')
+        df = safe_read_csv(file_path)
 
-        ma_column = f'MA{self.ma_period}'
-        required_cols = ['date', 'close', 'volume', ma_column, 'volume_ratio']
+        if df is None or df.empty:
+            return None, None, '数据不足'
 
-        if not all(col in df.columns for col in required_cols):
-            return False, None
+        # 确保日期格式正确
+        df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
 
-        row = df.iloc[idx]
+        # 找到选股日期后的第一个交易日
+        select_date_fmt = datetime.strptime(select_date, '%Y%m%d').strftime('%Y-%m-%d')
 
-        # 检查是否有足够的MA数据
-        if pd.isna(row[ma_column]) or pd.isna(row['volume_ratio']):
-            return False, None
+        # 从选股日期的下一天开始查找
+        future_data = df[df['date'] > select_date_fmt].sort_values('date')
 
-        # 条件1：成交量倍数 >= 阈值
-        volume_condition = row['volume_ratio'] >= self.volume_ratio_threshold
+        if future_data.empty:
+            return None, None, '数据不足'
 
-        # 条件2：收盘价 >= MA
-        price_condition = row['close'] >= row[ma_column]
+        # 检查是否ST股（简化判断，从stock_name中包含ST）
+        is_st = 'ST' in str(stock_code)
 
-        if volume_condition and price_condition:
-            signal = {
-                'stock_code': '',  # 需要外部填充
-                'date': row['date'],
-                'buy_price': float(row['close']),
-                'volume_ratio': float(row['volume_ratio']),
-                'ma_value': float(row[ma_column]),
-                'volume': float(row['volume']),
-            }
-            for col, key in [('open', 'bar_open'), ('high', 'bar_high'), ('low', 'bar_low')]:
-                if col in row.index and pd.notna(row[col]):
-                    signal[key] = float(row[col])
+        # 遍历未来交易日，找到第一个非秒板日
+        for idx in range(len(future_data)):
+            row = future_data.iloc[idx]
 
-            # 如果有前一日数据，计算前一日涨幅
-            if idx >= 1:
-                prev_close = df.iloc[idx - 1]['close']
-                signal['prev_change_pct'] = (row['close'] / prev_close - 1) * 100
-            else:
-                signal['prev_change_pct'] = 0
+            # 获取前一交易日收盘价
+            current_date = row['date']
+            prev_data = df[df['date'] < current_date]
+            if prev_data.empty:
+                continue
 
-            return True, signal
+            prev_close = prev_data.iloc[-1]['close']
+            open_price = row['open']
 
-        return False, None
+            # 检查是否秒板
+            if self.is_limit_up_open(open_price, prev_close, is_st):
+                # 秒板，继续找下一天
+                continue
 
-    def calculate_future_returns(self, df: pd.DataFrame, idx: int,
-                                 hold_days_list: List[int] = None) -> Dict[str, float]:
+            # 非秒板，可以买入
+            return current_date, open_price, '正常买入' if idx == 0 else f'秒板延后{idx}天'
+
+        # 所有未来交易日都是秒板，无法买入
+        return None, None, '连续秒板无法买入'
+
+    def calculate_returns(self, stock_code: str, buy_date: str, buy_price: float) -> Dict[int, Optional[float]]:
         """
-        计算买入后不同持有天数的收益率
-
-        Args:
-            df: 股票数据
-            idx: 买入日期索引
-            hold_days_list: 持有天数列表
+        计算不同持有天数的收益率
 
         Returns:
-            收益率字典 {'return_5d': 0.05, 'return_10d': 0.10, ...}
+            {持有天数: 收益率%, ...}
         """
-        if hold_days_list is None:
-            hold_days_list = [1, 3, 5, 10, 20, 30]
+        file_path = os.path.join(self.daily_dir, f'{stock_code}.csv')
+        df = safe_read_csv(file_path)
 
-        buy_price = df.iloc[idx]['close']
+        if df is None or df.empty:
+            return {days: None for days in self.HOLD_DAYS}
+
+        df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+        df = df.sort_values('date').reset_index(drop=True)
+
+        # 找到买入日期索引
+        buy_idx = df[df['date'] == buy_date].index
+        if len(buy_idx) == 0:
+            return {days: None for days in self.HOLD_DAYS}
+
+        buy_idx = buy_idx[0]
         results = {}
 
-        for days in hold_days_list:
-            future_idx = idx + days
-            if future_idx < len(df):
-                future_price = df.iloc[future_idx]['close']
-                ret = (future_price / buy_price - 1) * 100
-                results[f'return_{days}d'] = round(ret, 2)
-                results[f'exit_date_{days}d'] = df.iloc[future_idx]['date']
+        for hold_days in self.HOLD_DAYS:
+            sell_idx = buy_idx + hold_days
+
+            if sell_idx >= len(df):
+                results[hold_days] = None  # 数据不足
             else:
-                results[f'return_{days}d'] = None
-                results[f'exit_date_{days}d'] = None
-
-        # 计算最大回撤和最高收益（持有期内）
-        max_future_idx = min(idx + max(hold_days_list), len(df))
-        if max_future_idx > idx + 1:
-            price_slice = df.iloc[idx+1:max_future_idx]['close']
-            high_price = price_slice.max()
-            low_price = price_slice.min()
-
-            results['max_up_pct'] = round((high_price / buy_price - 1) * 100, 2)
-            results['max_down_pct'] = round((low_price / buy_price - 1) * 100, 2)
-
-            # 止损点：买入后最低跌破-10%
-            if results['max_down_pct'] <= -10:
-                results['stop_loss_triggered'] = True
-            else:
-                results['stop_loss_triggered'] = False
+                sell_price = df.iloc[sell_idx]['close']
+                return_pct = (sell_price - buy_price) / buy_price * 100
+                results[hold_days] = return_pct
 
         return results
 
-    def run_backtest(self) -> pd.DataFrame:
+    def backtest_single_result(self, result_file: str) -> List[Dict]:
         """
-        执行完整回测
+        回测单个选股结果文件
 
         Returns:
-            交易记录DataFrame
+            每笔交易的回测结果列表
         """
-        stock_data = self.load_all_stock_data()
+        select_date = self.parse_result_date(result_file)
+        if not select_date:
+            self.logger.warning(f"无法解析日期: {result_file}")
+            return []
 
-        if not stock_data:
-            self.logger.error("没有加载到任何股票数据，无法执行回测")
-            return pd.DataFrame()
+        # 读取选股结果
+        df = safe_read_csv(result_file)
+        if df is None or df.empty:
+            self.logger.warning(f"无法读取结果文件: {result_file}")
+            return []
 
-        self.logger.info("开始执行回测...")
+        results = []
+        code_col = '股票代码' if '股票代码' in df.columns else 'stock_code'
 
-        total_signals = 0
-        for stock_code, df in stock_data.items():
-            # 从MA周期之后开始检查（确保MA有效）
-            for idx in range(self.ma_period, len(df)):
-                is_signal, signal = self.check_buy_signal(df, idx)
+        for _, row in df.iterrows():
+            stock_code = str(row[code_col]).zfill(6)
 
-                if is_signal:
-                    total_signals += 1
-                    signal['stock_code'] = stock_code
-                    signal['stock_name'] = get_stock_name(stock_code)
+            # 确定买入日期和价格
+            buy_date, buy_price, buy_reason = self.find_buy_date(stock_code, select_date)
 
-                    # 计算后续收益
-                    returns = self.calculate_future_returns(df, idx)
-                    signal.update(returns)
-
-                    self.trades.append(signal.copy())
-
-                    # 记录信号日志
-                    self.logger.debug(
-                        f"信号 {stock_code} {signal['date'].strftime('%Y-%m-%d')}: "
-                        f"买入价={signal['buy_price']:.2f}, "
-                        f"量比={signal['volume_ratio']:.2f}"
-                    )
-
-        self.logger.info(f"回测完成！共发现 {total_signals} 个买入信号")
-
-        if self.trades:
-            trades_df = pd.DataFrame(self.trades)
-            trades_df = trades_df.sort_values('date')
-            return trades_df
-        else:
-            return pd.DataFrame()
-
-    def run_backtest_on_raw(self, raw_by_code: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-        """
-        在已缓存的日线 OHLCV 上回测（每条仅 copy 后计算指标），适用于参数网格搜索
-        """
-        self.trades = []
-        ma = self.ma_period
-        total_signals = 0
-        for stock_code, df in raw_by_code.items():
-            if df is None or len(df) < ma + 5:
+            if buy_date is None:
+                results.append({
+                    'select_date': select_date,
+                    'stock_code': stock_code,
+                    'stock_name': row.get('股票名称', row.get('stock_name', '')),
+                    'buy_date': None,
+                    'buy_price': None,
+                    'buy_reason': buy_reason,
+                    'score': row.get('综合评分', row.get('total_score', 0))
+                })
                 continue
-            df_an = self.analyzer.analyze_stock(df.copy(), ma_period=ma)
-            if df_an is None or df_an.empty:
-                continue
-            for idx in range(ma, len(df_an)):
-                is_signal, signal = self.check_buy_signal(df_an, idx)
-                if not is_signal:
-                    continue
-                total_signals += 1
-                signal['stock_code'] = stock_code
-                signal['stock_name'] = get_stock_name(stock_code)
-                returns = self.calculate_future_returns(df_an, idx)
-                signal.update(returns)
-                self.trades.append(signal.copy())
-        self.logger.info(f"回测完成！共发现 {total_signals} 个买入信号 (MA{ma}, 量比>={self.volume_ratio_threshold})")
-        if not self.trades:
-            return pd.DataFrame()
-        trades_df = pd.DataFrame(self.trades)
-        return trades_df.sort_values('date')
 
-    def analyze_results(self, trades_df: pd.DataFrame, 
-                       profit_threshold: float = 0.0) -> Dict:
+            # 计算收益率
+            returns = self.calculate_returns(stock_code, buy_date, buy_price)
+
+            result = {
+                'select_date': select_date,
+                'stock_code': stock_code,
+                'stock_name': row.get('股票名称', row.get('stock_name', '')),
+                'score': row.get('综合评分', row.get('total_score', 0)),
+                'buy_date': buy_date,
+                'buy_price': buy_price,
+                'buy_reason': buy_reason
+            }
+
+            # 添加各持有期收益
+            for hold_days in self.HOLD_DAYS:
+                result[f'return_{hold_days}d'] = returns.get(hold_days)
+
+            results.append(result)
+
+        return results
+
+    def run_backtest(self, days: int = 30) -> pd.DataFrame:
         """
-        分析回测结果
+        运行回测
 
         Args:
-            trades_df: 交易记录
-            profit_threshold: 盈利阈值(%)，默认0%即不亏就算盈利
+            days: 回测最近N天的选股结果
 
         Returns:
-            分析结果字典
+            回测结果DataFrame
         """
-        if trades_df.empty:
-            return {'error': '没有交易记录'}
+        # 获取历史结果文件
+        result_files = glob.glob(os.path.join(self.results_dir, 'monster_stock_*.csv'))
+        result_files.sort(reverse=True)  # 最新的在前
 
-        analysis = {}
-        analysis['total_trades'] = len(trades_df)
-        analysis['date_range'] = f"{trades_df['date'].min()} ~ {trades_df['date'].max()}"
+        # 选择最近N天的结果
+        selected_files = result_files[:days] if len(result_files) > days else result_files
 
-        # 按持有天数分析
-        hold_periods = [1, 3, 5, 10, 20]
+        self.logger.info(f"回测文件数: {len(selected_files)}")
 
-        for days in hold_periods:
-            col = f'return_{days}d'
-            if col not in trades_df.columns:
+        all_results = []
+        for result_file in selected_files:
+            self.logger.info(f"回测文件: {os.path.basename(result_file)}")
+            results = self.backtest_single_result(result_file)
+            all_results.extend(results)
+
+        if not all_results:
+            return pd.DataFrame()
+
+        return pd.DataFrame(all_results)
+
+    def generate_report(self, df: pd.DataFrame) -> str:
+        """
+        生成回测报告
+        """
+        if df.empty:
+            return "无回测数据"
+
+        lines = []
+        lines.append("=" * 80)
+        lines.append("选股策略回测报告")
+        lines.append("=" * 80)
+        lines.append(f"回测样本数: {len(df)} 笔")
+        lines.append(f"可买入样本: {df['buy_date'].notna().sum()} 笔")
+        lines.append("")
+
+        # 各持有期统计
+        for hold_days in self.HOLD_DAYS:
+            col = f'return_{hold_days}d'
+            valid_data = df[df[col].notna()]
+
+            if valid_data.empty:
+                lines.append(f"持有{hold_days}天: 无有效数据")
                 continue
 
-            # 过滤有数据的记录
-            valid_returns = trades_df[col].dropna()
-            if len(valid_returns) == 0:
+            returns = valid_data[col]
+
+            win_count = (returns > 0).sum()
+            total_count = len(returns)
+            win_rate = win_count / total_count * 100 if total_count > 0 else 0
+
+            avg_return = returns.mean()
+            max_return = returns.max()
+            min_return = returns.min()
+
+            lines.append(f"持有{hold_days}天统计:")
+            lines.append(f"  胜率: {win_rate:.1f}% ({win_count}/{total_count})")
+            lines.append(f"  平均收益: {avg_return:+.2f}%")
+            lines.append(f"  最大收益: {max_return:+.2f}%")
+            lines.append(f"  最小收益: {min_return:+.2f}%")
+            lines.append("")
+
+        # 按评分分组统计
+        lines.append("按综合评分分组（持有10天）:")
+        lines.append("-" * 40)
+
+        df['score_group'] = pd.cut(df['score'], bins=[0, 30, 40, 50, 60, 100], labels=['<30', '30-40', '40-50', '50-60', '60+'])
+
+        for group_name, group_df in df.groupby('score_group', observed=True):
+            valid_data = group_df[group_df['return_10d'].notna()]
+            if valid_data.empty:
                 continue
 
-            period_analysis = {}
-            period_analysis['sample_count'] = len(valid_returns)
-            period_analysis['mean_return'] = round(valid_returns.mean(), 2)
-            period_analysis['median_return'] = round(valid_returns.median(), 2)
-            period_analysis['max_return'] = round(valid_returns.max(), 2)
-            period_analysis['min_return'] = round(valid_returns.min(), 2)
-            period_analysis['std'] = round(valid_returns.std(), 2)
+            returns = valid_data['return_10d']
+            win_count = (returns > 0).sum()
+            total_count = len(returns)
+            win_rate = win_count / total_count * 100 if total_count > 0 else 0
+            avg_return = returns.mean()
 
-            # 获利概率
-            profit_count = (valid_returns > profit_threshold).sum()
-            period_analysis['profit_probability'] = round(profit_count / len(valid_returns) * 100, 2)
+            lines.append(f"  评分{group_name}: 胜率{win_rate:.1f}%, 平均收益{avg_return:+.2f}% ({total_count}笔)")
 
-            # 亏损概率
-            loss_count = (valid_returns < 0).sum()
-            period_analysis['loss_probability'] = round(loss_count / len(valid_returns) * 100, 2)
+        lines.append("")
+        lines.append("=" * 80)
 
-            # 盈亏比
-            avg_profit = valid_returns[valid_returns > 0].mean() if (valid_returns > 0).any() else 0
-            avg_loss = abs(valid_returns[valid_returns < 0].mean()) if (valid_returns < 0).any() else 1
-            period_analysis['profit_loss_ratio'] = round(avg_profit / avg_loss, 2) if avg_loss > 0 else 0
-
-            analysis[f'hold_{days}d'] = period_analysis
-
-        # 分年度统计
-        trades_df['year'] = pd.to_datetime(trades_df['date']).dt.year
-        yearly_stats = []
-        for year in sorted(trades_df['year'].unique()):
-            year_df = trades_df[trades_df['year'] == year]
-            year_stat = {
-                'year': year,
-                'trade_count': len(year_df),
-                'avg_return_5d': round(year_df['return_5d'].mean(), 2) if 'return_5d' in year_df.columns else None,
-                'profit_rate_5d': round((year_df['return_5d'] > 0).sum() / len(year_df) * 100, 2) if 'return_5d' in year_df.columns else None
-            }
-            yearly_stats.append(year_stat)
-        analysis['yearly_stats'] = yearly_stats
-
-        return analysis
-
-    def save_results(self, trades_df: pd.DataFrame, analysis: Dict):
-        """保存回测结果"""
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-        # 保存交易记录
-        trades_file = f'./build/backtest_trades_{timestamp}.csv'
-        trades_df.to_csv(trades_file, index=False, encoding='utf-8-sig')
-        self.logger.info(f"交易记录已保存: {trades_file}")
-
-        # 生成报告
-        report_file = f'./build/backtest_report_{timestamp}.txt'
-        with open(report_file, 'w', encoding='utf-8') as f:
-            f.write("=" * 60 + "\n")
-            f.write("选股策略回测报告\n")
-            f.write("=" * 60 + "\n\n")
-
-            f.write(f"策略说明：\n")
-            f.write(f"- 买入条件：成交量倍数 >= {self.volume_ratio_threshold} 且 收盘价 >= MA{self.ma_period}\n")
-            f.write(f"- 回测区间：{self.start_date.strftime('%Y-%m-%d')} ~ {self.end_date.strftime('%Y-%m-%d')}\n")
-            f.write(f"- 总交易次数：{analysis.get('total_trades', 0)}\n\n")
-
-            f.write("-" * 60 + "\n")
-            f.write("按持有周期分析\n")
-            f.write("-" * 60 + "\n\n")
-
-            for days in [1, 3, 5, 10, 20]:
-                key = f'hold_{days}d'
-                if key not in analysis:
-                    continue
-
-                stats = analysis[key]
-                f.write(f"持有 {days} 天:\n")
-                f.write(f"  样本数量: {stats['sample_count']}\n")
-                f.write(f"  平均收益: {stats['mean_return']:.2f}%\n")
-                f.write(f"  中位数收益: {stats['median_return']:.2f}%\n")
-                f.write(f"  最大收益: {stats['max_return']:.2f}%\n")
-                f.write(f"  最大亏损: {stats['min_return']:.2f}%\n")
-                f.write(f"  收益标准差: {stats['std']:.2f}%\n")
-                f.write(f"  获利概率: {stats['profit_probability']:.2f}%\n")
-                f.write(f"  亏损概率: {stats['loss_probability']:.2f}%\n")
-                f.write(f"  盈亏比: {stats['profit_loss_ratio']:.2f}\n\n")
-
-            if 'yearly_stats' in analysis:
-                f.write("-" * 60 + "\n")
-                f.write("年度统计\n")
-                f.write("-" * 60 + "\n\n")
-                f.write(f"{'年份':<10}{'交易次数':<15}{'5日平均收益':<15}{'5日胜率':<10}\n")
-                for stat in analysis['yearly_stats']:
-                    f.write(f"{stat['year']:<10}{stat['trade_count']:<15}{str(stat['avg_return_5d']):<15}{str(stat['profit_rate_5d']):<10}\n")
-
-        self.logger.info(f"回测报告已保存: {report_file}")
-        return trades_file, report_file
-
-    def print_summary(self, analysis: Dict):
-        """打印回测结果摘要"""
-        print("\n" + "=" * 70)
-        print("选股策略回测结果")
-        print("=" * 70)
-
-        if 'error' in analysis:
-            print(f"错误: {analysis['error']}")
-            return
-
-        print(f"\n策略条件：")
-        print(f"  - 成交量倍数 >= {self.volume_ratio_threshold}")
-        print(f"  - 收盘价 >= MA{self.ma_period}")
-        print(f"  - 回测区间: {analysis.get('date_range', 'N/A')}")
-        print(f"  - 总交易次数: {analysis.get('total_trades', 0)}")
-
-        print("\n" + "-" * 70)
-        print("按持有周期统计")
-        print("-" * 70)
-
-        for days in [1, 3, 5, 10, 20]:
-            key = f'hold_{days}d'
-            if key not in analysis:
-                continue
-
-            stats = analysis[key]
-            sample_count = stats.get('sample_count', 0)
-            if sample_count == 0:
-                print(f"\n持有 {days} 天: 无有效数据")
-                continue
-
-            print(f"\n持有 {days} 天:")
-            print(f"  样本数: {sample_count:>6}")
-            print(f"  平均收益: {stats.get('mean_return', 0):>6.2f}%")
-            print(f"  中位数: {stats.get('median_return', 0):>6.2f}%")
-            print(f"  最大盈利: {stats.get('max_return', 0):>6.2f}%")
-            print(f"  最大亏损: {stats.get('min_return', 0):>6.2f}%")
-            print(f"  获利概率: {stats.get('profit_probability', 0):>6.2f}%")
-            print(f"  亏损概率: {stats.get('loss_probability', 0):>6.2f}%")
-            print(f"  盈亏比: {stats.get('profit_loss_ratio', 0):>6.2f}")
-
-        if 'yearly_stats' in analysis:
-            print("\n" + "-" * 70)
-            print("年度统计")
-            print("-" * 70)
-            print(f"{'年份':<12}{'交易次数':<15}{'5日平均收益':<15}{'5日胜率':<10}")
-            for stat in analysis['yearly_stats']:
-                print(f"{stat['year']:<12}{stat['trade_count']:<15}{str(stat['avg_return_5d']):<15}{str(stat['profit_rate_5d']):<10}")
-
-        print("=" * 70 + "\n")
+        return "\n".join(lines)
 
 
 def main():
-    """主函数"""
-    print("=" * 70)
-    print("选股策略回测系统")
-    print("=" * 70)
+    """主入口"""
+    import argparse
 
-    # 检查数据目录
-    daily_dir = './data/daily'
-    if not os.path.exists(daily_dir):
-        print(f"错误: 数据目录 {daily_dir} 不存在")
-        return
+    parser = argparse.ArgumentParser(description='选股策略回测')
+    parser.add_argument('--days', type=int, default=30,
+                        help='回测最近N天的选股结果（默认30天）')
+    parser.add_argument('--output', type=str, default='data/results/backtest_result.csv',
+                        help='回测结果输出文件')
+    parser.add_argument('--daily-dir', type=str, default='data/daily',
+                        help='日线数据目录')
+    parser.add_argument('--results-dir', type=str, default='data/results',
+                        help='选股结果目录')
 
-    # 创建回测器 - 使用更灵活的参数适配现有数据
+    args = parser.parse_args()
+
+    print("=" * 80)
+    print("选股策略回测")
+    print("=" * 80)
+    print(f"日线数据目录: {args.daily_dir}")
+    print(f"选股结果目录: {args.results_dir}")
+    print(f"回测天数: {args.days}")
+    print("")
+
+    # 创建回测器
     backtest = StrategyBacktest(
-        daily_dir=daily_dir,
-        start_date='2020-01-01',
-        ma_period=20,  # 使用MA20而不是MA120，因为数据时间范围有限
-        volume_ratio_threshold=2.0,  # 降低阈值以便测试
-        hold_days=5
+        daily_dir=args.daily_dir,
+        results_dir=args.results_dir
     )
 
-    # 执行回测
-    print("\n开始执行回测，这可能需要几分钟时间...")
-    trades_df = backtest.run_backtest()
+    # 运行回测
+    result_df = backtest.run_backtest(days=args.days)
 
-    if trades_df.empty:
-        print("未发现符合条件的买入信号")
-        print("\n可能原因：")
-        print("1. 数据不足 - 需要2020年以来的完整历史数据")
-        print("2. 策略条件过于严格 - 可以尝试降低 volume_ratio_threshold")
-        print("3. 数据格式问题")
-        return
-
-    # 分析结果
-    analysis = backtest.analyze_results(trades_df)
-
-    # 打印摘要
-    backtest.print_summary(analysis)
+    if result_df.empty:
+        print("回测失败: 无有效数据")
+        return 1
 
     # 保存结果
-    trades_file, report_file = backtest.save_results(trades_df, analysis)
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    result_df.to_csv(args.output, index=False, encoding='utf-8-sig')
+    print(f"回测明细已保存: {args.output}")
+    print("")
 
-    print(f"\n结果文件：")
-    print(f"  交易记录: {trades_file}")
-    print(f"  回测报告: {report_file}")
+    # 生成报告
+    report = backtest.generate_report(result_df)
+    print(report)
 
-    # 展示部分妖股记录
-    print("\n" + "-" * 70)
-    print("买入信号列表 (按成交量倍数排序):")
-    print("-" * 70)
-    trades_sorted = trades_df.sort_values('volume_ratio', ascending=False)
+    # 保存报告
+    report_file = args.output.replace('.csv', '_report.txt')
+    with open(report_file, 'w', encoding='utf-8') as f:
+        f.write(report)
+    print(f"报告已保存: {report_file}")
 
-    # 显示收益率最高的几笔交易（如果数据允许）
-    for _, row in trades_sorted.head(20).iterrows():
-        date_str = row['date'].strftime('%Y-%m-%d') if isinstance(row['date'], pd.Timestamp) else str(row['date'])
-        ret_5d = row.get('return_5d', None)
-        ret_10d = row.get('return_10d', None)
-
-        ret_5d_str = f"{ret_5d:.2f}%" if pd.notna(ret_5d) and ret_5d is not None else "N/A"
-        ret_10d_str = f"{ret_10d:.2f}%" if pd.notna(ret_10d) and ret_10d is not None else "N/A"
-
-        print(f"  {row['stock_code']:<10} {row['stock_name'] or '':<10} {date_str} "
-              f"买入价:{row['buy_price']:<8.2f} 量比:{row['volume_ratio']:<6.2f} "
-              f"5日收益:{ret_5d_str:<10} 10日收益:{ret_10d_str}")
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
