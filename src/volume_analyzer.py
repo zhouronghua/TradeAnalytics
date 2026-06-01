@@ -252,12 +252,22 @@ class VolumeAnalyzer:
             if update_data:
                 self.logger.info("\n[步骤1/3] 更新交易数据...")
                 try:
-                    success, total, failed = self.downloader.update_all_stocks()
-                    if not success:
-                        self.logger.warning(f"数据更新不完全成功: 总计{total}, 失败{failed}")
-                        # 继续执行分析，使用现有数据
+                    # 先确保股票列表存在
+                    stock_list = self.downloader.download_stock_list()
+                    if stock_list is None:
+                        self.logger.error("无法获取股票列表")
+                        self.logger.info("将使用现有数据继续分析...")
                     else:
-                        self.logger.info(f"数据更新成功: 总计{total}, 失败{failed}")
+                        self.logger.info(f"获取到 {len(stock_list)} 只股票")
+                        
+                        # 下载/更新股票数据
+                        success_count, fail_count = self.downloader.download_all_stocks(stock_list)
+                        total = success_count + fail_count
+                        
+                        if fail_count > 0:
+                            self.logger.warning(f"数据更新部分失败: 总计{total}, 成功{success_count}, 失败{fail_count}")
+                        else:
+                            self.logger.info(f"数据更新成功: 总计{total}, 成功{success_count}")
                 except Exception as e:
                     self.logger.error(f"数据更新失败: {e}")
                     self.logger.info("将使用现有数据继续分析...")
@@ -267,12 +277,25 @@ class VolumeAnalyzer:
             # 步骤2: 执行成交量分析
             self.logger.info("\n[步骤2/3] 分析成交量暴涨股票...")
             
+            # 检查数据目录
+            if not os.path.exists(self.stocks_dir):
+                self.logger.error(f"数据目录不存在: {self.stocks_dir}")
+                self.logger.error("请先运行数据下载或使用 --no-update 参数（需先有数据）")
+                return False
+            
             # 获取所有股票CSV文件
             csv_files = glob.glob(os.path.join(self.stocks_dir, '*.csv'))
             csv_files = [f for f in csv_files if os.path.basename(f) != 'stock_list.csv']
             
             if not csv_files:
                 self.logger.error(f"未找到股票数据文件: {self.stocks_dir}")
+                self.logger.error("可能原因:")
+                self.logger.error("  1. 首次运行尚未下载数据")
+                self.logger.error("  2. 数据下载失败")
+                self.logger.error("  3. 数据目录配置错误")
+                self.logger.error("\n解决方法:")
+                self.logger.error("  - 运行完整下载: python src/volume_analyzer.py")
+                self.logger.error("  - 或手动下载数据: python -c \"from src.data_downloader import DataDownloader; d=DataDownloader(); d.download_all_stocks()\"")
                 return False
             
             self.logger.info(f"找到 {len(csv_files)} 个股票数据文件")

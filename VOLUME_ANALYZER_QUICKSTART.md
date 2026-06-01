@@ -53,7 +53,29 @@ push_type = serverchan
 serverchan_key = your_sendkey     # 从 https://sct.ftqq.com/ 获取
 ```
 
-### 第二步：测试配置
+### 第二步：首次运行（下载数据）
+
+**重要：首次运行需要下载历史数据！**
+
+```bash
+# 方法1: 使用初始化脚本（推荐）
+python init_first_run.py
+
+# 方法2: 直接运行分析（会自动下载）
+python src/volume_analyzer.py
+```
+
+初始化脚本会：
+1. 下载股票列表（约5000只股票）
+2. 询问是否下载历史数据
+3. 显示下载进度和统计
+
+注意事项：
+- 首次下载需要较长时间（建议在非交易时段进行）
+- 建议将 `config.ini` 中的 `daily_download_limit_mb` 设为 `0`（无限制）
+- 可随时按 Ctrl+C 中断，已下载的数据会保存
+
+### 第三步：测试配置
 
 ```bash
 # 运行配置测试脚本
@@ -64,14 +86,18 @@ python test_batch_setup.py
 - 配置文件是否正确
 - 目录结构是否完整
 - 数据源是否可用
+- 股票数据是否已下载
 - 邮件配置是否正确
 - 方糖推送是否正常
 
-### 第三步：首次运行
+### 第四步：运行分析
 
 ```bash
 # 完整运行（更新数据 + 分析 + 推送）
 python src/volume_analyzer.py
+
+# 使用现有数据分析（不更新）
+python src/volume_analyzer.py --no-update
 
 # 或使用封装脚本（推荐）
 ./run_volume_analyzer.sh          # Linux/macOS
@@ -94,7 +120,7 @@ python src/volume_analyzer.py --no-notification
 python src/volume_analyzer.py --no-email --no-notification
 ```
 
-### 第四步：添加到 Crontab（定时任务）
+### 第五步：添加到 Crontab（定时任务）
 
 #### Linux/macOS
 
