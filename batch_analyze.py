@@ -4,11 +4,12 @@
 TradeAnalytics 批量分析CLI入口
 
 用法:
-    python batch_analyze.py                    # 完整流程: 更新数据 + 妖股筛选 + Server酱推送
+    python batch_analyze.py                    # 完整流程: 更新数据 + 成交量暴涨分析 + 邮件/方糖推送
     python batch_analyze.py --skip-download    # 跳过数据下载，直接分析
     python batch_analyze.py --no-push          # 分析完成后不推送
     python batch_analyze.py --test-push        # 仅发送 Server酱 测试消息
-    python batch_analyze.py --volume-only      # 仅成交量暴涨分析
+    python batch_analyze.py --monster-only     # 仅妖股综合筛选(旧逻辑)
+    python batch_analyze.py --volume-only      # 等同于默认行为
 """
 
 import argparse
@@ -26,7 +27,11 @@ if sys.version_info[0] < 3:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.utils import setup_logger, Config, is_trading_day, get_last_trading_day, get_last_trading_day_str
+from src.utils import (
+    setup_logger, Config, is_trading_day, get_last_trading_day,
+    get_last_trading_day_str, is_data_up_to_date, get_local_latest_data_date,
+    get_latest_signal_date,
+)
 from src.data_downloader import DataDownloader
 from src.monster_stock_analyzer import MonsterStockAnalyzer
 from src.volume_analyzer import analyze_volume_surge
@@ -47,7 +52,9 @@ def parse_args():
     parser.add_argument('--test-email', action='store_true',
                         help='已弃用，等同于 --test-push')
     parser.add_argument('--volume-only', action='store_true',
-                        help='仅执行成交量暴涨分析(原有逻辑)')
+                        help='成交量暴涨分析(默认行为，可省略)')
+    parser.add_argument('--monster-only', action='store_true',
+                        help='仅执行妖股综合筛选(旧逻辑)')
     parser.add_argument('--force-non-trading', action='store_true',
                         help='已弃用，非交易日默认也会执行（自动使用最近交易日数据）')
     parser.add_argument('--require-fresh-data', action='store_true',
@@ -193,14 +200,25 @@ def check_data_freshness(config_file: str, logger, stale_days: int = 7, referenc
 
     for csv_file in csv_files[:sample_size]:
         try:
-            df = pd.read_csv(csv_file, nrows=5)  # 只读前几行
-            if 'date' in df.columns:
-                dates = pd.to_datetime(df['date'], errors='coerce')
-                if not dates.empty:
-                    file_latest = dates.max()
-                    if latest_date is None or file_latest > latest_date:
-                        latest_date = file_latest
+            df = pd.read_csv(csv_file, usecols=['date'])
+            if df.empty:
+                continue
+            file_latest = pd.to_datetime(df['date'], errors='coerce').max()
+            if pd.notna(file_latest) and (latest_date is None or file_latest > latest_date):
+                latest_date = file_latest
             checked_files += 1
+        except (ValueError, KeyError):
+            try:
+                df = pd.read_csv(csv_file)
+                if 'date' not in df.columns or df.empty:
+                    continue
+                file_latest = pd.to_datetime(df['date'], errors='coerce').max()
+                if pd.notna(file_latest) and (latest_date is None or file_latest > latest_date):
+                    latest_date = file_latest
+                checked_files += 1
+            except Exception as e:
+                logger.debug(f"检查文件 {csv_file} 失败: {e}")
+                continue
         except Exception as e:
             logger.debug(f"检查文件 {csv_file} 失败: {e}")
             continue
@@ -362,35 +380,121 @@ def run_monster_analysis(config_file: str, logger):
     return results_df, output_file
 
 
-def run_volume_analysis(config_file: str, logger):
-    """运行成交量暴涨分析"""
+def run_volume_analysis(config_file: str, logger, signal_date: datetime = None):
+    """运行成交量暴涨分析，仅保留信号日当天的结果"""
     config = Config(config_file)
     daily_dir = config.get('Paths', 'daily_dir', fallback='./data/daily')
     results_dir = config.get('Paths', 'results_dir', fallback='./data/results')
+    ma_period = config.getint('Analysis', 'ma_period', fallback=5)
+    volume_ratio = config.getfloat('Analysis', 'volume_ratio_threshold', fallback=5.0)
+    volume_avg_days = config.getint('Analysis', 'volume_avg_days', fallback=5)
+
+    if signal_date is None:
+        signal_date = get_latest_signal_date()
+    signal_date_str = signal_date.strftime('%Y-%m-%d')
 
     csv_files = glob.glob(os.path.join(daily_dir, '*.csv'))
     if not csv_files:
         logger.warning("未找到股票数据文件")
-        return None, None
+        return None, None, signal_date_str
 
-    logger.info(f"开始成交量暴涨分析: {len(csv_files)} 只股票")
+    logger.info(
+        f"开始成交量暴涨分析: {len(csv_files)} 只股票 "
+        f"(信号日 {signal_date_str}, 前{volume_avg_days}日均量>={volume_ratio}倍 + 突破MA{ma_period})"
+    )
 
     def progress(current, total, message):
         if current % 500 == 0 or current == total:
             logger.info(f"  {message}")
 
-    results_df = analyze_volume_surge(csv_files, progress)
+    results_df = analyze_volume_surge(
+        csv_files, progress,
+        volume_avg_days=volume_avg_days,
+        volume_ratio_threshold=volume_ratio,
+        ma_period=ma_period,
+    )
+
+    if not results_df.empty:
+        results_df['date'] = pd.to_datetime(results_df['date'])
+        today_df = results_df[results_df['date'] == pd.to_datetime(signal_date_str)]
+        results_df = today_df.copy()
+        results_df['date'] = results_df['date'].dt.strftime('%Y-%m-%d')
+        logger.info(f"信号日 {signal_date_str} 筛选结果: {len(results_df)} 只")
 
     if results_df.empty:
-        logger.info("未发现符合条件的股票")
-        return results_df, None
+        logger.info(f"信号日 {signal_date_str} 未发现符合条件的股票")
+        return results_df, None, signal_date_str
 
     os.makedirs(results_dir, exist_ok=True)
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_file = os.path.join(results_dir, f'volume_surge_{ts}.csv')
     results_df.to_csv(output_file, index=False, encoding='utf-8-sig')
     logger.info(f"成交量分析完成: {len(results_df)} 只, 保存 {output_file}")
-    return results_df, output_file
+    return results_df, output_file, signal_date_str
+
+
+def _results_df_to_matched_stocks(results_df: pd.DataFrame) -> list:
+    """将分析结果转为推送用的股票列表"""
+    matched = []
+    for _, row in results_df.iterrows():
+        matched.append({
+            'code': row['stock_code'],
+            'name': row['stock_name'],
+            'date': row['date'],
+            'close': row['close'],
+            'ma': row['ma'],
+            'volume_ratio': row['volume_ratio'],
+        })
+    return matched
+
+
+def push_volume_results(config_file: str, logger, results_df, signal_date_str: str):
+    """推送成交量暴涨分析结果（邮件 + Server酱）"""
+    config = Config(config_file)
+    strategy_meta = {
+        'ma_period': config.getint('Analysis', 'ma_period', fallback=5),
+        'volume_ratio_threshold': config.getfloat('Analysis', 'volume_ratio_threshold', fallback=5.0),
+        'volume_avg_days': config.getint('Analysis', 'volume_avg_days', fallback=5),
+        'from_validated': False,
+    }
+
+    matched_stocks = _results_df_to_matched_stocks(results_df) if results_df is not None and not results_df.empty else []
+    email_sender = EmailSender(config_file)
+    notifier = NotificationService(config_file)
+
+    logger.info("--- 成交量暴涨推送(邮件+Server酱) ---")
+
+    email_ok = False
+    try:
+        if matched_stocks:
+            email_ok = email_sender.send_volume_ma_screening_report(
+                matched_stocks, signal_date_str, strategy_meta
+            )
+        else:
+            email_ok = email_sender.send_volume_ma_screening_empty(
+                signal_date_str, strategy_meta
+            )
+        if email_ok:
+            print("[OK] 成交量分析报告已通过邮件发送")
+        else:
+            print("[FAIL] 邮件发送失败，请检查 [Email] 配置")
+    except Exception as e:
+        logger.warning(f"邮件推送失败: {e}")
+
+    serverchan_ok = False
+    try:
+        serverchan_ok = notifier.send_volume_surge_report_serverchan(
+            matched_stocks, signal_date_str, strategy_meta
+        )
+        if serverchan_ok:
+            print("[OK] 成交量分析结果已通过 Server酱 发送")
+        else:
+            print("[FAIL] Server酱 发送失败，请检查 serverchan_key")
+    except Exception as e:
+        logger.warning(f"Server酱推送失败: {e}")
+
+    if not email_ok and not serverchan_ok:
+        logger.error("邮件和 Server酱 都发送失败")
 
 
 def main():
@@ -416,6 +520,10 @@ def main():
     else:
         analysis_date = today
         logger.info(f"今天是交易日: {analysis_date.strftime('%Y-%m-%d')}")
+
+    signal_date = get_latest_signal_date(analysis_date)
+    signal_date_str = signal_date.strftime('%Y-%m-%d')
+    logger.info(f"信号日期(T+1最新数据日): {signal_date_str}")
 
     # 步骤1: 检查并确保数据最新（数据截止到最近交易日）
     if not args.skip_download:
@@ -467,8 +575,12 @@ def main():
                         else:
                             logger.warning("历史数据下载失败，将尝试使用现有数据继续")
             else:
-                logger.info("数据较新，尝试增量更新...")
-                download_data(args.config, logger)
+                up_to_date, up_to_date_msg = is_data_up_to_date(daily_dir, analysis_date)
+                if up_to_date:
+                    logger.info(f"数据已是最新，跳过更新 ({up_to_date_msg})")
+                else:
+                    logger.info(f"{up_to_date_msg}，开始增量更新...")
+                    download_data(args.config, logger)
     else:
         logger.info("跳过数据下载（--skip-download）")
 
@@ -484,12 +596,16 @@ def main():
                 sys.exit(1)
 
     # 步骤2: 分析
-    if args.volume_only:
-        logger.info("--- 成交量暴涨分析 ---")
-        results_df, output_file = run_volume_analysis(args.config, logger)
-    else:
+    run_monster = args.monster_only and not args.volume_only
+    if run_monster:
         logger.info("--- 妖股综合筛选 ---")
         results_df, output_file = run_monster_analysis(args.config, logger)
+        signal_date_str = analysis_date.strftime('%Y-%m-%d')
+    else:
+        logger.info("--- 成交量暴涨分析 ---")
+        results_df, output_file, signal_date_str = run_volume_analysis(
+            args.config, logger, signal_date
+        )
 
     # 步骤3: 输出结果摘要
     if results_df is not None and not results_df.empty:
@@ -515,39 +631,14 @@ def main():
     else:
         print("\n未发现符合条件的候选股")
 
-    # 步骤4: 推送（邮件 + Server酱同时尝试，互不影响）
-    # 使用analysis_date作为推送日期（非交易日时为最近交易日）
-    analysis_date_str = analysis_date.strftime('%Y-%m-%d')
-
+    # 步骤4: 推送（邮件 + Server酱）
     skip_push = args.no_push or args.no_email
     if not skip_push:
-        email_sender = EmailSender(args.config)
-        notifier = NotificationService(args.config)
-
-        if args.volume_only:
-            logger.info("--- Server酱 推送(成交量分析) ---")
-            if results_df is not None and not results_df.empty:
-                title = f"[量暴] {analysis_date_str} {len(results_df)} 只"
-                preview = results_df.head(
-                    notifier.config.getint('Notification', 'push_max_stocks', fallback=20)
-                ).to_string(index=False)
-                body = (
-                    f"分析日期: {analysis_date_str}\n"
-                    f"结果文件: {output_file or '(未写入路径)'}\n\n"
-                    f"{preview}"
-                )
-                ok = notifier.send_serverchan_fallback(title, body)
-            else:
-                title = f"[量暴] {analysis_date_str} 无标的"
-                body = "本次成交量暴涨分析未发现符合条件的股票。"
-                ok = notifier.send_serverchan_fallback(title, body)
-            if ok:
-                print("[OK] 成交量分析结果已通过 Server酱 发送")
-            else:
-                print("[FAIL] Server酱 发送失败，请检查 serverchan_key")
-        else:
+        if run_monster:
+            email_sender = EmailSender(args.config)
+            notifier = NotificationService(args.config)
+            analysis_date_str = analysis_date.strftime('%Y-%m-%d')
             logger.info("--- 妖股筛选推送(邮件+Server酱) ---")
-            # 尝试邮件推送（失败不阻塞Server酱）
             email_ok = False
             try:
                 email_ok = email_sender.send_monster_stock_report(results_df, analysis_date_str)
@@ -556,7 +647,6 @@ def main():
             except Exception as e:
                 logger.warning(f"邮件推送失败(忽略): {e}")
 
-            # 尝试Server酱推送（失败不阻塞邮件）
             serverchan_ok = False
             try:
                 serverchan_ok = notifier.send_monster_stock_report_serverchan(results_df, analysis_date_str)
@@ -565,9 +655,10 @@ def main():
             except Exception as e:
                 logger.warning(f"Server酱推送失败(忽略): {e}")
 
-            # 汇总结果
             if not email_ok and not serverchan_ok:
                 print("[FAIL] 邮件和 Server酱 都发送失败")
+        else:
+            push_volume_results(args.config, logger, results_df, signal_date_str)
 
     print("\n分析完成.")
 

@@ -230,6 +230,86 @@ def get_last_trading_day_str(reference_date: datetime = None, fmt: str = '%Y-%m-
     return last_trading.strftime(fmt)
 
 
+def get_latest_signal_date(reference_date: datetime = None) -> datetime:
+    """
+    获取可分析的最新信号日期（T+1 数据源下，参考日上一自然日对应的最近交易日）
+    """
+    if reference_date is None:
+        reference_date = datetime.now()
+    return get_last_trading_day(reference_date - timedelta(days=1))
+
+
+def get_local_latest_data_date(daily_dir: str, sample_size: int = 100) -> Optional[datetime]:
+    """
+    获取本地日线数据中的最新交易日期
+
+    Args:
+        daily_dir: 日线数据目录
+        sample_size: 抽样检查的文件数量上限
+
+    Returns:
+        最新日期，无数据时返回 None
+    """
+    import glob
+
+    csv_files = glob.glob(os.path.join(daily_dir, '*.csv'))
+    if not csv_files:
+        return None
+
+    latest_date = None
+    for csv_file in csv_files[:sample_size]:
+        try:
+            df = pd.read_csv(csv_file, usecols=['date'])
+            if df.empty:
+                continue
+            file_latest = pd.to_datetime(df['date'], errors='coerce').max()
+            if pd.notna(file_latest) and (latest_date is None or file_latest > latest_date):
+                latest_date = file_latest
+        except (ValueError, KeyError):
+            try:
+                df = pd.read_csv(csv_file)
+                if 'date' not in df.columns or df.empty:
+                    continue
+                file_latest = pd.to_datetime(df['date'], errors='coerce').max()
+                if pd.notna(file_latest) and (latest_date is None or file_latest > latest_date):
+                    latest_date = file_latest
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+    return latest_date.to_pydatetime() if latest_date is not None else None
+
+
+def is_data_up_to_date(daily_dir: str, reference_date: datetime = None) -> tuple:
+    """
+    判断本地数据是否已更新到参考日期对应的最近交易日
+
+    数据源通常为 T+1，以「参考日上一自然日」对应的最近交易日作为可获得的目标日期。
+
+    Returns:
+        (是否最新, 状态说明)
+    """
+    if reference_date is None:
+        reference_date = datetime.now()
+
+    # T+1：当日收盘数据通常下一交易日才可用
+    data_reference = reference_date - timedelta(days=1)
+    expected_date = get_last_trading_day(data_reference)
+    local_latest = get_local_latest_data_date(daily_dir)
+
+    if local_latest is None:
+        return False, "本地无数据"
+
+    expected_str = expected_date.strftime('%Y-%m-%d')
+    local_str = local_latest.strftime('%Y-%m-%d')
+
+    if local_latest.date() >= expected_date.date():
+        return True, f"数据已是最新 (本地 {local_str}，目标 {expected_str})"
+
+    return False, f"数据需更新 (本地 {local_str}，目标 {expected_str})"
+
+
 def format_date(date_str: str, input_format: str = '%Y%m%d', output_format: str = '%Y-%m-%d') -> str:
     """
     日期格式转换

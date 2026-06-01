@@ -334,7 +334,7 @@ class EmailSender:
         ma = strategy_meta.get("ma_period", "")
         vol = strategy_meta.get("volume_ratio_threshold", "")
         tag = "已验证策略" if strategy_meta.get("from_validated") else "配置回退"
-        subject = f"[选股-{tag}] {analysis_date} MA{ma} 量比>={vol} | {len(matched_stocks)} 只"
+        subject = f"[量暴] {analysis_date} 前{strategy_meta.get('volume_avg_days','')}日均量>={vol}倍+突破MA{ma} | {len(matched_stocks)} 只"
         html = self._build_volume_ma_screening_html(
             matched_stocks, analysis_date, strategy_meta
         )
@@ -358,7 +358,7 @@ class EmailSender:
         ma = strategy_meta.get("ma_period", "")
         vol = strategy_meta.get("volume_ratio_threshold", "")
         tag = "已验证策略" if strategy_meta.get("from_validated") else "配置回退"
-        subject = f"[选股-{tag}] {analysis_date} MA{ma} 量比>={vol} | 无标的"
+        subject = f"[量暴] {analysis_date} 前{strategy_meta.get('volume_avg_days','')}日均量>={vol}倍+突破MA{ma} | 无标的"
         detail = self._strategy_meta_text_html(strategy_meta)
         html = f"""
         <html><head><meta charset="utf-8"></head>
@@ -384,7 +384,9 @@ class EmailSender:
 
     def _strategy_meta_plain(self, strategy_meta: Dict[str, Any]) -> str:
         lines = [
-            f"参数: MA{strategy_meta.get('ma_period','')} 量比>={strategy_meta.get('volume_ratio_threshold','')}",
+            f"参数: 前{strategy_meta.get('volume_avg_days', strategy_meta.get('ma_period',''))}日均量"
+            f">={strategy_meta.get('volume_ratio_threshold','')}倍，"
+            f"突破MA{strategy_meta.get('ma_period','')}",
             f"来源: {'已验证 strategy JSON' if strategy_meta.get('from_validated') else 'config.ini 回退'}",
         ]
         if strategy_meta.get("strategy_file"):
@@ -405,8 +407,8 @@ class EmailSender:
         fpath = strategy_meta.get("strategy_file") or "—"
         return f"""
         <div style="background:#f8f9fa;padding:12px 16px;border-radius:6px;font-size:14px;color:#333;">
-        <p style="margin:4px 0;"><b>条件</b>：收盘 &gt;= MA{strategy_meta.get("ma_period","")}，
-        量比 &gt;= {strategy_meta.get("volume_ratio_threshold","")}</p>
+        <p style="margin:4px 0;"><b>条件</b>：当日成交量 &gt;= 前{strategy_meta.get("volume_avg_days", strategy_meta.get("ma_period",""))}日均量
+        {strategy_meta.get("volume_ratio_threshold","")}倍，收盘价突破 MA{strategy_meta.get("ma_period","")}</p>
         <p style="margin:4px 0;"><b>参数来源</b>：{src}</p>
         <p style="margin:4px 0;"><b>策略文件</b>：{fpath}</p>
         <p style="margin:4px 0;"><b>历史综合胜率(5/10/20日)</b>：{cw_s}</p>

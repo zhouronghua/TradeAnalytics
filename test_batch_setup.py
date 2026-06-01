@@ -215,13 +215,12 @@ def test_volume_analyzer(config_file='config/config.ini'):
         
         print(f"MA周期: {analyzer.ma_period}")
         print(f"量比阈值: {analyzer.volume_ratio}")
-        print(f"数据目录: {analyzer.stocks_dir}")
+        print(f"数据目录: {analyzer.daily_dir}")
         print(f"结果目录: {analyzer.results_dir}")
         
         # 检查数据文件
         import glob
-        csv_files = glob.glob(os.path.join(analyzer.stocks_dir, '*.csv'))
-        csv_files = [f for f in csv_files if os.path.basename(f) != 'stock_list.csv']
+        csv_files = glob.glob(os.path.join(analyzer.daily_dir, '*.csv'))
         
         if csv_files:
             print(f"数据文件: {len(csv_files)} 个")

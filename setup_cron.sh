@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # 设置 TradeAnalytics 定时任务
-# 每个工作日 9:00, 12:00, 15:30 执行妖股筛选并发送邮件
+# 每个工作日 9:00, 12:00, 15:30 执行成交量暴涨分析并推送邮件+方糖
 #
 # 用法: bash setup_cron.sh [install|remove|status]
 

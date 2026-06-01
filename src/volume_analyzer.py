@@ -14,7 +14,7 @@ from typing import List, Dict, Optional
 # 添加父目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.utils import setup_logger, Config, ensure_dir
+from src.utils import setup_logger, Config, ensure_dir, is_data_up_to_date, get_last_trading_day
 from src.data_downloader import DataDownloader
 from src.notification import NotificationService
 from src.email_sender import EmailSender
@@ -62,14 +62,20 @@ def get_stock_name(stock_code: str) -> str:
     return stock_code
 
 
-def analyze_volume_surge(csv_files: List[str], progress_callback=None) -> pd.DataFrame:
+def analyze_volume_surge(csv_files: List[str], progress_callback=None,
+                         volume_avg_days: int = 5,
+                         volume_ratio_threshold: float = 5.0,
+                         ma_period: int = 5) -> pd.DataFrame:
     """
     分析成交量暴涨股票
-    规则：当天成交量是前7天平均成交量的5倍以上，且收盘价在均线之上
+    规则：当天成交量 >= 前5日平均成交量的5倍，且收盘价突破MA5日均线
     
     Args:
         csv_files: CSV文件路径列表
         progress_callback: 进度回调函数
+        volume_avg_days: 均量计算天数
+        volume_ratio_threshold: 量比阈值
+        ma_period: 均线周期（默认MA5）
     
     Returns:
         分析结果DataFrame
@@ -79,7 +85,12 @@ def analyze_volume_surge(csv_files: List[str], progress_callback=None) -> pd.Dat
     total = len(csv_files)
     
     for file_path in csv_files:
-        results = analyze_stock_flexible(file_path)
+        results = analyze_stock_flexible(
+            file_path,
+            volume_avg_days=volume_avg_days,
+            volume_ratio_threshold=volume_ratio_threshold,
+            ma_period=ma_period,
+        )
         
         if results:
             all_results.extend(results)
@@ -114,16 +125,22 @@ def analyze_volume_surge(csv_files: List[str], progress_callback=None) -> pd.Dat
     return results_df
 
 
-def analyze_stock_flexible(file_path: str, recent_days: int = 30) -> Optional[List[Dict]]:
+def analyze_stock_flexible(file_path: str, recent_days: int = 30,
+                           volume_avg_days: int = 5,
+                           volume_ratio_threshold: float = 5.0,
+                           ma_period: int = 5) -> Optional[List[Dict]]:
     """
     灵活分析单只股票
-    规则：检查最近N天的数据，找出成交量 >= 前7天平均成交量5倍的日期，且收盘价 > 均线
+    规则：检查最近N天的数据，找出成交量 >= 前5日平均成交量5倍的日期，且收盘价突破MA5
     
     注意：BaoStock是T+1数据，当天的数据要第二天才能获取
     
     Args:
         file_path: CSV文件路径
         recent_days: 检查最近N天的数据，默认30天
+        volume_avg_days: 均量计算天数
+        volume_ratio_threshold: 量比阈值
+        ma_period: 均线周期
     
     Returns:
         符合条件的记录列表
@@ -131,7 +148,8 @@ def analyze_stock_flexible(file_path: str, recent_days: int = 30) -> Optional[Li
     try:
         df = pd.read_csv(file_path, dtype={'code': str})
         
-        if len(df) < 10:
+        min_days = max(ma_period, volume_avg_days) + 1
+        if len(df) < min_days:
             return None
         
         # 确保日期排序
@@ -141,41 +159,34 @@ def analyze_stock_flexible(file_path: str, recent_days: int = 30) -> Optional[Li
         # 记录最新数据日期（用于调试）
         latest_date = df['date'].max()
         
-        # 计算能计算的均线
-        if len(df) >= 120:
-            ma_period = 120
-        elif len(df) >= 60:
-            ma_period = 60
-        elif len(df) >= 30:
-            ma_period = 30
-        else:
-            ma_period = 10
-        
         df['ma'] = df['close'].rolling(window=ma_period).mean()
         
         # 获取最近N天的数据（扩大分析范围）
-        recent_data = df.tail(min(recent_days, len(df)))
+        recent_data = df.tail(min(recent_days, len(df))).reset_index(drop=True)
         
         results = []
         
-        # 检查每一天（需要至少8天数据：当天 + 前7天）
-        for i in range(7, len(recent_data)):
+        # 检查每一天（需要至少 volume_avg_days 天历史 + 前一日用于判断突破）
+        start_idx = max(volume_avg_days, ma_period)
+        for i in range(start_idx, len(recent_data)):
             current = recent_data.iloc[i]
+            previous = recent_data.iloc[i - 1]
             
-            # 跳过MA为空的数据
-            if pd.isna(current['ma']):
+            if pd.isna(current['ma']) or pd.isna(previous['ma']):
                 continue
             
-            # 计算前7天的平均成交量
-            prev_7_days = recent_data.iloc[i-7:i]
-            avg_7day_volume = prev_7_days['volume'].mean()
+            prev_days = recent_data.iloc[i - volume_avg_days:i]
+            avg_volume = prev_days['volume'].mean()
             
-            # 检查条件：当天成交量是前7天平均成交量的5倍以上
-            volume_ratio = current['volume'] / avg_7day_volume if avg_7day_volume > 0 else 0
+            volume_ratio = current['volume'] / avg_volume if avg_volume > 0 else 0
+            ma_breakout = (
+                previous['close'] <= previous['ma']
+                and current['close'] > current['ma']
+            )
             
-            if volume_ratio >= 5.0 and current['close'] > current['ma']:
+            if volume_ratio >= volume_ratio_threshold and ma_breakout:
                 stock_code = os.path.basename(file_path).replace('.csv', '')
-                stock_name = get_stock_name(stock_code)  # 从股票列表中获取真实名称
+                stock_name = get_stock_name(stock_code)
                 
                 results.append({
                     'stock_code': stock_code,
@@ -185,10 +196,10 @@ def analyze_stock_flexible(file_path: str, recent_days: int = 30) -> Optional[Li
                     'ma': current['ma'],
                     'ma_period': ma_period,
                     'volume': current['volume'],
-                    'avg_7day_volume': int(avg_7day_volume),
+                    'avg_5day_volume': int(avg_volume),
                     'volume_ratio': volume_ratio,
                     'price_above_ma': ((current['close'] - current['ma']) / current['ma'] * 100),
-                    'data_latest_date': latest_date.strftime('%Y-%m-%d')  # 添加最新数据日期
+                    'data_latest_date': latest_date.strftime('%Y-%m-%d')
                 })
         
         return results
@@ -212,10 +223,12 @@ class VolumeAnalyzer:
         self.logger = setup_logger('VolumeAnalyzer')
         
         # 读取配置
+        self.daily_dir = self.config.get('Paths', 'daily_dir', fallback='./data/daily')
         self.stocks_dir = self.config.get('Paths', 'stocks_dir', fallback='./data/stocks')
         self.results_dir = self.config.get('Paths', 'results_dir', fallback='./data/results')
-        self.ma_period = self.config.getint('Analysis', 'ma_period', fallback=20)
+        self.ma_period = self.config.getint('Analysis', 'ma_period', fallback=5)
         self.volume_ratio = self.config.getfloat('Analysis', 'volume_ratio_threshold', fallback=5.0)
+        self.volume_avg_days = self.config.getint('Analysis', 'volume_avg_days', fallback=5)
         
         # 确保目录存在
         ensure_dir(self.results_dir)
@@ -225,7 +238,10 @@ class VolumeAnalyzer:
         self.notifier = NotificationService(config_file)
         self.email_sender = EmailSender(config_file)
         
-        self.logger.info(f"成交量分析器初始化完成 (MA={self.ma_period}, 量比>={self.volume_ratio})")
+        self.logger.info(
+            f"成交量分析器初始化完成 (MA{self.ma_period}突破, "
+            f"前{self.volume_avg_days}日均量>={self.volume_ratio}倍)"
+        )
     
     def run_batch_analysis(self, update_data: bool = True, 
                           send_email: bool = True, 
@@ -251,44 +267,47 @@ class VolumeAnalyzer:
             # 步骤1: 更新数据
             if update_data:
                 self.logger.info("\n[步骤1/3] 更新交易数据...")
-                try:
-                    # 先确保股票列表存在
-                    stock_list = self.downloader.download_stock_list()
-                    if stock_list is None:
-                        self.logger.error("无法获取股票列表")
-                        self.logger.info("将使用现有数据继续分析...")
-                    else:
-                        self.logger.info(f"获取到 {len(stock_list)} 只股票")
-                        
-                        # 下载/更新股票数据
-                        success_count, fail_count = self.downloader.download_all_stocks(stock_list)
-                        total = success_count + fail_count
-                        
-                        if fail_count > 0:
-                            self.logger.warning(f"数据更新部分失败: 总计{total}, 成功{success_count}, 失败{fail_count}")
+                analysis_ref = get_last_trading_day(datetime.now())
+                up_to_date, status_msg = is_data_up_to_date(self.daily_dir, analysis_ref)
+                if up_to_date:
+                    self.logger.info(f"跳过数据更新: {status_msg}")
+                else:
+                    self.logger.info(status_msg)
+                    try:
+                        stock_list = self.downloader.download_stock_list()
+                        if stock_list is None:
+                            self.logger.error("无法获取股票列表")
+                            self.logger.info("将使用现有数据继续分析...")
                         else:
-                            self.logger.info(f"数据更新成功: 总计{total}, 成功{success_count}")
-                except Exception as e:
-                    self.logger.error(f"数据更新失败: {e}")
-                    self.logger.info("将使用现有数据继续分析...")
+                            self.logger.info(f"获取到 {len(stock_list)} 只股票")
+                            
+                            success_count, fail_count = self.downloader.download_all_stocks(stock_list)
+                            total = success_count + fail_count
+                            
+                            if fail_count > 0:
+                                self.logger.warning(f"数据更新部分失败: 总计{total}, 成功{success_count}, 失败{fail_count}")
+                            else:
+                                self.logger.info(f"数据更新成功: 总计{total}, 成功{success_count}")
+                    except Exception as e:
+                        self.logger.error(f"数据更新失败: {e}")
+                        self.logger.info("将使用现有数据继续分析...")
             else:
                 self.logger.info("\n[步骤1/3] 跳过数据更新（使用现有数据）")
             
             # 步骤2: 执行成交量分析
             self.logger.info("\n[步骤2/3] 分析成交量暴涨股票...")
             
-            # 检查数据目录
-            if not os.path.exists(self.stocks_dir):
-                self.logger.error(f"数据目录不存在: {self.stocks_dir}")
+            # 检查数据目录（日线数据保存在 daily_dir，与 DataDownloader 一致）
+            if not os.path.exists(self.daily_dir):
+                self.logger.error(f"数据目录不存在: {self.daily_dir}")
                 self.logger.error("请先运行数据下载或使用 --no-update 参数（需先有数据）")
                 return False
             
             # 获取所有股票CSV文件
-            csv_files = glob.glob(os.path.join(self.stocks_dir, '*.csv'))
-            csv_files = [f for f in csv_files if os.path.basename(f) != 'stock_list.csv']
+            csv_files = glob.glob(os.path.join(self.daily_dir, '*.csv'))
             
             if not csv_files:
-                self.logger.error(f"未找到股票数据文件: {self.stocks_dir}")
+                self.logger.error(f"未找到股票数据文件: {self.daily_dir}")
                 self.logger.error("可能原因:")
                 self.logger.error("  1. 首次运行尚未下载数据")
                 self.logger.error("  2. 数据下载失败")
@@ -301,7 +320,12 @@ class VolumeAnalyzer:
             self.logger.info(f"找到 {len(csv_files)} 个股票数据文件")
             
             # 执行分析
-            results_df = analyze_volume_surge(csv_files)
+            results_df = analyze_volume_surge(
+                csv_files,
+                volume_avg_days=self.volume_avg_days,
+                volume_ratio_threshold=self.volume_ratio,
+                ma_period=self.ma_period,
+            )
             
             if results_df.empty:
                 self.logger.info("未找到符合条件的股票")

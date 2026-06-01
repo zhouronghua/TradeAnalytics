@@ -13,8 +13,9 @@ source = baostock
 update_stock_list_days = 1
 
 [Analysis]
-ma_period = 20
+ma_period = 5
 volume_ratio_threshold = 5.0
+volume_avg_days = 5
 min_history_days = 30
 
 [Scheduler]

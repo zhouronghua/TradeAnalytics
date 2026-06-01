@@ -193,6 +193,7 @@ class NotificationService:
         ) is not None:
             ma = strategy_meta.get('ma_period', '')
             vol = strategy_meta.get('volume_ratio_threshold', '')
+            avg_days = strategy_meta.get('volume_avg_days')
             src = (
                 '已验证 best_strategy.json'
                 if strategy_meta.get('from_validated')
@@ -202,9 +203,15 @@ class NotificationService:
             path_line = f"\n- 策略文件: {path_note}" if path_note else ""
             cw = strategy_meta.get('composite_win_rate_pct')
             cw_line = f"\n- 回测综合胜率(5/10/20日): {cw}%" if cw is not None else ""
+            if avg_days:
+                cond = (
+                    f"当日成交量>=前{avg_days}日均量{vol}倍，"
+                    f"收盘价突破MA{ma}"
+                )
+            else:
+                cond = f"量比>={vol}，收盘价>=MA{ma}"
             content += (
-                f"- 筛选条件: 量比(当日成交量/昨量)>={vol}，"
-                f"收盘价>=MA{ma}（来源: {src}）{path_line}{cw_line}\n\n"
+                f"- 筛选条件: {cond}（来源: {src}）{path_line}{cw_line}\n\n"
             )
         else:
             content += "- 筛选条件: 见任务日志中的 MA 与量比阈值\n\n"
@@ -548,6 +555,31 @@ class NotificationService:
             f"发送时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             "若收到本消息，说明 Server酱（sctapi）配置正确。"
         )
+        return self.send_serverchan_fallback(title, content)
+
+    def send_volume_surge_report_serverchan(
+        self,
+        matched_stocks: List[Dict],
+        signal_date: str,
+        strategy_meta: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """成交量暴涨结果通过 Server 酱推送（不依赖 Notification.enabled）。"""
+        strategy_meta = strategy_meta or {}
+        ma = strategy_meta.get('ma_period', '')
+        vol = strategy_meta.get('volume_ratio_threshold', '')
+        avg_days = strategy_meta.get('volume_avg_days', '')
+        if matched_stocks:
+            title = f"[量暴] {signal_date} 前{avg_days}日均量>={vol}倍+突破MA{ma} | {len(matched_stocks)}只"
+            content = self._format_stocks_content(
+                matched_stocks, signal_date, strategy_meta=strategy_meta
+            )
+        else:
+            title = f"[量暴] {signal_date} 无标的"
+            content = (
+                f"信号日期: {signal_date}\n"
+                f"筛选条件: 当日成交量>=前{avg_days}日均量{vol}倍，收盘价突破MA{ma}\n\n"
+                "本次未发现符合条件的股票。"
+            )
         return self.send_serverchan_fallback(title, content)
 
     def send_monster_stock_report_serverchan(
