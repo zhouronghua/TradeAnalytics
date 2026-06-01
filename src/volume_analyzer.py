@@ -1,11 +1,23 @@
 """
 成交量分析模块
+支持批处理运行，自动更新数据并推送分析结果
 """
 
 import pandas as pd
 import os
 import glob
+import sys
+import argparse
+from datetime import datetime
 from typing import List, Dict, Optional
+
+# 添加父目录到路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.utils import setup_logger, Config, ensure_dir
+from src.data_downloader import DataDownloader
+from src.notification import NotificationService
+from src.email_sender import EmailSender
 
 # 全局股票列表缓存
 _stock_list_cache = None
@@ -183,3 +195,267 @@ def analyze_stock_flexible(file_path: str, recent_days: int = 30) -> Optional[Li
     
     except Exception as e:
         return None
+
+
+class VolumeAnalyzer:
+    """成交量分析器（支持批处理）"""
+    
+    def __init__(self, config_file: str = 'config/config.ini'):
+        """
+        初始化成交量分析器
+        
+        Args:
+            config_file: 配置文件路径
+        """
+        self.config_file = config_file
+        self.config = Config(config_file)
+        self.logger = setup_logger('VolumeAnalyzer')
+        
+        # 读取配置
+        self.stocks_dir = self.config.get('Paths', 'stocks_dir', fallback='./data/stocks')
+        self.results_dir = self.config.get('Paths', 'results_dir', fallback='./data/results')
+        self.ma_period = self.config.getint('Analysis', 'ma_period', fallback=20)
+        self.volume_ratio = self.config.getfloat('Analysis', 'volume_ratio_threshold', fallback=5.0)
+        
+        # 确保目录存在
+        ensure_dir(self.results_dir)
+        
+        # 初始化组件
+        self.downloader = DataDownloader(config_file)
+        self.notifier = NotificationService(config_file)
+        self.email_sender = EmailSender(config_file)
+        
+        self.logger.info(f"成交量分析器初始化完成 (MA={self.ma_period}, 量比>={self.volume_ratio})")
+    
+    def run_batch_analysis(self, update_data: bool = True, 
+                          send_email: bool = True, 
+                          send_notification: bool = True) -> bool:
+        """
+        运行批处理分析
+        
+        Args:
+            update_data: 是否更新数据
+            send_email: 是否发送邮件
+            send_notification: 是否发送方糖推送
+        
+        Returns:
+            是否成功
+        """
+        try:
+            self.logger.info("="*60)
+            self.logger.info("开始批处理成交量分析")
+            self.logger.info("="*60)
+            
+            analysis_date = datetime.now().strftime('%Y-%m-%d')
+            
+            # 步骤1: 更新数据
+            if update_data:
+                self.logger.info("\n[步骤1/3] 更新交易数据...")
+                try:
+                    success, total, failed = self.downloader.update_all_stocks()
+                    if not success:
+                        self.logger.warning(f"数据更新不完全成功: 总计{total}, 失败{failed}")
+                        # 继续执行分析，使用现有数据
+                    else:
+                        self.logger.info(f"数据更新成功: 总计{total}, 失败{failed}")
+                except Exception as e:
+                    self.logger.error(f"数据更新失败: {e}")
+                    self.logger.info("将使用现有数据继续分析...")
+            else:
+                self.logger.info("\n[步骤1/3] 跳过数据更新（使用现有数据）")
+            
+            # 步骤2: 执行成交量分析
+            self.logger.info("\n[步骤2/3] 分析成交量暴涨股票...")
+            
+            # 获取所有股票CSV文件
+            csv_files = glob.glob(os.path.join(self.stocks_dir, '*.csv'))
+            csv_files = [f for f in csv_files if os.path.basename(f) != 'stock_list.csv']
+            
+            if not csv_files:
+                self.logger.error(f"未找到股票数据文件: {self.stocks_dir}")
+                return False
+            
+            self.logger.info(f"找到 {len(csv_files)} 个股票数据文件")
+            
+            # 执行分析
+            results_df = analyze_volume_surge(csv_files)
+            
+            if results_df.empty:
+                self.logger.info("未找到符合条件的股票")
+                matched_count = 0
+            else:
+                matched_count = len(results_df)
+                self.logger.info(f"找到 {matched_count} 只符合条件的股票")
+                
+                # 保存结果
+                output_file = os.path.join(
+                    self.results_dir, 
+                    f"volume_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                )
+                results_df.to_csv(output_file, index=False, encoding='utf-8-sig')
+                self.logger.info(f"结果已保存: {output_file}")
+            
+            # 步骤3: 发送通知
+            self.logger.info("\n[步骤3/3] 发送分析结果...")
+            
+            # 准备推送数据
+            matched_stocks = []
+            if not results_df.empty:
+                for _, row in results_df.iterrows():
+                    matched_stocks.append({
+                        'code': row['stock_code'],
+                        'name': row['stock_name'],
+                        'date': row['date'],
+                        'close': row['close'],
+                        'ma': row['ma'],
+                        'volume_ratio': row['volume_ratio']
+                    })
+            
+            # 发送邮件
+            if send_email and self.email_sender.enabled:
+                try:
+                    if matched_stocks:
+                        strategy_meta = {
+                            'ma_period': self.ma_period,
+                            'volume_ratio_threshold': self.volume_ratio,
+                            'from_validated': False
+                        }
+                        email_success = self.email_sender.send_volume_ma_screening_report(
+                            matched_stocks, analysis_date, strategy_meta
+                        )
+                        if email_success:
+                            self.logger.info("邮件发送成功")
+                        else:
+                            self.logger.warning("邮件发送失败")
+                    else:
+                        strategy_meta = {
+                            'ma_period': self.ma_period,
+                            'volume_ratio_threshold': self.volume_ratio,
+                            'from_validated': False
+                        }
+                        self.email_sender.send_volume_ma_screening_empty(
+                            analysis_date, strategy_meta
+                        )
+                        self.logger.info("已发送空结果邮件")
+                except Exception as e:
+                    self.logger.error(f"邮件发送异常: {e}")
+            
+            # 发送方糖推送
+            if send_notification and self.notifier.enabled:
+                try:
+                    if matched_stocks:
+                        strategy_meta = {
+                            'ma_period': self.ma_period,
+                            'volume_ratio_threshold': self.volume_ratio,
+                            'from_validated': False
+                        }
+                        notify_success = self.notifier.send_analysis_result(
+                            matched_stocks, analysis_date, 
+                            include_history=True, 
+                            strategy_meta=strategy_meta
+                        )
+                        if notify_success:
+                            self.logger.info("方糖推送成功")
+                        else:
+                            self.logger.warning("方糖推送失败")
+                    else:
+                        self.logger.info("无符合条件的股票，跳过方糖推送")
+                except Exception as e:
+                    self.logger.error(f"方糖推送异常: {e}")
+            
+            self.logger.info("\n" + "="*60)
+            self.logger.info(f"批处理分析完成! 找到 {matched_count} 只符合条件的股票")
+            self.logger.info("="*60)
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"批处理分析异常: {e}", exc_info=True)
+            return False
+
+
+def main():
+    """主程序入口"""
+    parser = argparse.ArgumentParser(
+        description='成交量分析批处理工具',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例:
+  # 完整运行（更新数据+分析+推送）
+  python src/volume_analyzer.py
+  
+  # 只分析，不更新数据
+  python src/volume_analyzer.py --no-update
+  
+  # 只分析，不发送任何通知
+  python src/volume_analyzer.py --no-email --no-notification
+  
+  # 指定配置文件
+  python src/volume_analyzer.py --config config/custom.ini
+
+适用场景:
+  - crontab定时任务
+  - 手动批处理分析
+  - 数据更新后的自动分析
+        """
+    )
+    
+    parser.add_argument(
+        '--config', 
+        default='config/config.ini',
+        help='配置文件路径 (默认: config/config.ini)'
+    )
+    parser.add_argument(
+        '--no-update',
+        action='store_true',
+        help='不更新数据，使用现有数据'
+    )
+    parser.add_argument(
+        '--no-email',
+        action='store_true',
+        help='不发送邮件'
+    )
+    parser.add_argument(
+        '--no-notification',
+        action='store_true',
+        help='不发送方糖推送'
+    )
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='显示详细日志'
+    )
+    
+    args = parser.parse_args()
+    
+    # 检查配置文件
+    if not os.path.exists(args.config):
+        print(f"错误: 配置文件不存在: {args.config}")
+        print(f"请复制 config/config.ini.example 为 {args.config} 并配置")
+        return 1
+    
+    try:
+        # 创建分析器
+        analyzer = VolumeAnalyzer(args.config)
+        
+        # 运行批处理分析
+        success = analyzer.run_batch_analysis(
+            update_data=not args.no_update,
+            send_email=not args.no_email,
+            send_notification=not args.no_notification
+        )
+        
+        return 0 if success else 1
+        
+    except KeyboardInterrupt:
+        print("\n用户中断操作")
+        return 130
+    except Exception as e:
+        print(f"运行出错: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
