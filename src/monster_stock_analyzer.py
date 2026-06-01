@@ -40,6 +40,8 @@ class MonsterStockAnalyzer:
         self.consecutive_limit_days = 2 # 连板天数阈值
         self.rsi_strong_threshold = 60  # RSI强势区间下限
         self.price_rise_pct = 10.0      # 短期涨幅阈值(%)
+        self.max_results = 0            # 最大输出数量，0=不限制
+        self.output_mode = 'all'        # 输出模式: all/new_only
 
         if config:
             self._load_config(config)
@@ -57,6 +59,101 @@ class MonsterStockAnalyzer:
         self.consecutive_limit_days = config.getint(section, 'consecutive_limit_days', fallback=self.consecutive_limit_days)
         self.rsi_strong_threshold = config.getfloat(section, 'rsi_strong_threshold', fallback=self.rsi_strong_threshold)
         self.price_rise_pct = config.getfloat(section, 'price_rise_pct', fallback=self.price_rise_pct)
+        self.max_results = config.getint(section, 'max_results', fallback=self.max_results)
+        self.output_mode = config.get(section, 'output_mode', fallback=self.output_mode)
+
+    # ------------------------------------------------------------------
+    # 历史记录管理
+    # ------------------------------------------------------------------
+
+    def _get_history_file(self, results_dir: str) -> str:
+        """获取历史记录文件路径"""
+        return os.path.join(results_dir, 'monster_stock_history.csv')
+
+    def _load_history(self, results_dir: str) -> set:
+        """
+        加载历史妖股记录
+
+        Returns:
+            历史入选的股票代码集合
+        """
+        history_file = self._get_history_file(results_dir)
+        if not os.path.exists(history_file):
+            return set()
+
+        try:
+            df = pd.read_csv(history_file, dtype={'stock_code': str})
+            if 'stock_code' in df.columns:
+                return set(df['stock_code'].astype(str).tolist())
+        except Exception as e:
+            self.logger.warning(f"加载历史记录失败: {e}")
+
+        return set()
+
+    def _save_history(self, results_dir: str, current_df: pd.DataFrame):
+        """
+        保存历史妖股记录（追加新入选的股票）
+
+        Args:
+            results_dir: 结果目录
+            current_df: 当前分析结果DataFrame
+        """
+        if current_df is None or current_df.empty:
+            return
+
+        history_file = self._get_history_file(results_dir)
+
+        try:
+            # 获取当前入选的股票代码和日期
+            new_records = current_df[['stock_code', 'date']].copy()
+            new_records['first_seen'] = datetime.now().strftime('%Y-%m-%d')
+
+            # 如果历史文件存在，合并后去重
+            if os.path.exists(history_file):
+                hist_df = pd.read_csv(history_file, dtype={'stock_code': str})
+                combined = pd.concat([hist_df, new_records], ignore_index=True)
+                # 按股票代码去重，保留最早的记录
+                combined = combined.drop_duplicates(subset=['stock_code'], keep='first')
+                combined.to_csv(history_file, index=False, encoding='utf-8-sig')
+            else:
+                new_records.to_csv(history_file, index=False, encoding='utf-8-sig')
+
+            self.logger.info(f"历史记录已更新: {len(new_records)} 只新入选股票")
+
+        except Exception as e:
+            self.logger.warning(f"保存历史记录失败: {e}")
+
+    def _filter_new_stocks_only(self, df: pd.DataFrame, results_dir: str) -> pd.DataFrame:
+        """
+        筛选首次入选的妖股（历史上未入选过的）
+
+        Args:
+            df: 当前分析结果DataFrame
+            results_dir: 结果目录
+
+        Returns:
+            仅包含新入选股票的DataFrame
+        """
+        if df is None or df.empty:
+            return df
+
+        history_codes = self._load_history(results_dir)
+        if not history_codes:
+            self.logger.info("无历史记录，所有股票视为首次入选")
+            return df
+
+        # 筛选不在历史记录中的股票
+        current_codes = set(df['stock_code'].astype(str).tolist())
+        new_codes = current_codes - history_codes
+
+        if not new_codes:
+            self.logger.info(f"本次无新入选妖股（共分析 {len(current_codes)} 只，均已在历史记录中）")
+            return pd.DataFrame()
+
+        new_df = df[df['stock_code'].astype(str).isin(new_codes)].copy()
+        self.logger.info(f"筛选首次入选: {len(new_df)}/{len(df)} 只（历史记录共 {len(history_codes)} 只）")
+
+        return new_df
 
     # ------------------------------------------------------------------
     # 技术指标计算
@@ -411,6 +508,12 @@ class MonsterStockAnalyzer:
 
         df = pd.DataFrame(results)
         df = df.sort_values('total_score', ascending=False)
+
+        # 限制输出数量
+        if self.max_results > 0 and len(df) > self.max_results:
+            df = df.head(self.max_results)
+            self.logger.info(f"结果已裁剪为前 {self.max_results} 只股票")
+
         return df
 
     def run(self, daily_dir: str, results_dir: str,
@@ -436,6 +539,23 @@ class MonsterStockAnalyzer:
             return results_df, None
 
         os.makedirs(results_dir, exist_ok=True)
+
+        # 保存本次所有符合条件的股票到历史记录
+        self._save_history(results_dir, results_df)
+
+        # 根据输出模式决定是否筛选
+        if self.output_mode == 'new_only':
+            # 仅输出首次入选的股票
+            new_stocks_df = self._filter_new_stocks_only(results_df, results_dir)
+            if new_stocks_df.empty:
+                self.logger.info("本次无首次入选的妖股（所有候选已在历史记录中）")
+                return new_stocks_df, None
+            results_df = new_stocks_df
+            self.logger.info(f"筛选首次入选: {len(results_df)} 只")
+        else:
+            # output_mode='all' 或其他值：输出当前交易日所有符合条件的
+            self.logger.info(f"输出所有符合条件的: {len(results_df)} 只")
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_file = os.path.join(results_dir, f'monster_stock_{timestamp}.csv')
 
@@ -464,5 +584,5 @@ class MonsterStockAnalyzer:
         export_df.rename(columns=rename_map, inplace=True)
         export_df.to_csv(output_file, index=False, encoding='utf-8-sig')
 
-        self.logger.info(f"妖股筛选完成: {len(results_df)} 只候选, 已保存 {output_file}")
+        self.logger.info(f"妖股筛选完成: {len(results_df)} 只首次入选, 已保存 {output_file}")
         return results_df, output_file
