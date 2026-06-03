@@ -122,6 +122,90 @@ class NotificationService:
             self.logger.error(f"不支持的推送类型: {self.push_type}")
             return False
     
+    def send_empty_analysis_result(self, analysis_date: str = None,
+                                   strategy_meta: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        发送空分析结果通知（当天或前一天没有符合条件的股票）
+        
+        Args:
+            analysis_date: 分析日期
+            strategy_meta: 策略参数字典
+        
+        Returns:
+            是否发送成功
+        """
+        if not self.enabled:
+            self.logger.info("消息推送未启用")
+            return False
+        
+        if analysis_date is None:
+            analysis_date = datetime.now().strftime('%Y-%m-%d')
+        
+        strategy_meta = strategy_meta or {}
+        ma = strategy_meta.get('ma_period', '')
+        vol = strategy_meta.get('volume_ratio_threshold', '')
+        if ma != '' and vol != '':
+            tag = '验证' if strategy_meta.get('from_validated') else '配置'
+            title = f"选股[{tag}] {analysis_date} MA{ma} 量比>={vol} | 无符合标的"
+        else:
+            title = f"股票分析结果 {analysis_date} | 无符合标的"
+        
+        # 生成空结果内容
+        content = self._format_empty_result_content(analysis_date, strategy_meta)
+        
+        # 根据类型发送
+        if self.push_type == 'serverchan':
+            return self._send_serverchan(title, content)
+        elif self.push_type == 'qywechat':
+            return self._send_qywechat(title, content)
+        elif self.push_type == 'pushplus':
+            return self._send_pushplus(title, content)
+        elif self.push_type == 'wechat_official':
+            # 微信公众号暂不支持空消息，直接返回
+            self.logger.info("微信公众号跳过空结果推送")
+            return True
+        else:
+            self.logger.error(f"不支持的推送类型: {self.push_type}")
+            return False
+    
+    def _format_empty_result_content(self, date: str, 
+                                    strategy_meta: Optional[Dict[str, Any]] = None) -> str:
+        """
+        格式化空结果推送内容
+        
+        Args:
+            date: 分析日期
+            strategy_meta: 策略参数
+        
+        Returns:
+            格式化后的内容
+        """
+        strategy_meta = strategy_meta or {}
+        ma = strategy_meta.get('ma_period', '')
+        vol = strategy_meta.get('volume_ratio_threshold', '')
+        
+        content = "## 今日摘要\n\n"
+        content += f"- 分析日期: {date}\n"
+        content += f"- 符合条件股票: **0** 只\n"
+        
+        if ma != '' and vol != '':
+            src = (
+                '已验证 best_strategy.json'
+                if strategy_meta.get('from_validated')
+                else 'config.ini [Analysis]'
+            )
+            content += f"- 筛选条件: 量比(当日成交量/昨量)>={vol}，收盘价>=MA{ma}（来源: {src}）\n\n"
+        else:
+            content += "- 筛选条件: 见配置文件\n\n"
+        
+        content += "## 分析结果\n\n"
+        content += "今日未发现符合条件的股票。\n\n"
+        content += "**注意**: 仅统计最近2天的数据，不会推送历史数据。\n\n"
+        content += "---\n\n"
+        content += f"发送时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        
+        return content
+    
     def _get_history_results(self) -> Optional[List[Tuple[str, int]]]:
         """
         获取最近几天的分析结果统计

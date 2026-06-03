@@ -65,7 +65,8 @@ def get_stock_name(stock_code: str) -> str:
 def analyze_volume_surge(csv_files: List[str], progress_callback=None,
                          volume_avg_days: int = 5,
                          volume_ratio_threshold: float = 5.0,
-                         ma_period: int = 5) -> pd.DataFrame:
+                         ma_period: int = 5,
+                         max_days_old: int = 2) -> pd.DataFrame:
     """
     分析成交量暴涨股票
     规则：当天成交量 >= 前5日平均成交量的5倍，且收盘价突破MA5日均线
@@ -76,6 +77,7 @@ def analyze_volume_surge(csv_files: List[str], progress_callback=None,
         volume_avg_days: 均量计算天数
         volume_ratio_threshold: 量比阈值
         ma_period: 均线周期（默认MA5）
+        max_days_old: 最多保留几天前的数据（默认2天，即当天或前一天）
     
     Returns:
         分析结果DataFrame
@@ -117,6 +119,16 @@ def analyze_volume_surge(csv_files: List[str], progress_callback=None,
     results_df['date'] = pd.to_datetime(results_df['date'])
     results_df = results_df.sort_values('date', ascending=False)
     results_df = results_df.drop_duplicates(subset='stock_code', keep='first')
+    
+    # 重要：过滤掉数据日期过旧的股票
+    # 只保留最近 max_days_old 天的数据（避免把几个月前的数据当作最新数据）
+    today = pd.Timestamp.now().normalize()
+    cutoff_date = today - pd.Timedelta(days=max_days_old)
+    
+    results_df = results_df[results_df['date'] >= cutoff_date]
+    
+    if results_df.empty:
+        return pd.DataFrame()
     
     # 转换回字符串格式并按成交量倍数排序
     results_df['date'] = results_df['date'].dt.strftime('%Y-%m-%d')
@@ -319,20 +331,26 @@ class VolumeAnalyzer:
             
             self.logger.info(f"找到 {len(csv_files)} 个股票数据文件")
             
-            # 执行分析
+            # 执行分析（只保留最近2天的数据）
             results_df = analyze_volume_surge(
                 csv_files,
                 volume_avg_days=self.volume_avg_days,
                 volume_ratio_threshold=self.volume_ratio,
                 ma_period=self.ma_period,
+                max_days_old=2,  # 只保留最近2天的数据
             )
             
             if results_df.empty:
-                self.logger.info("未找到符合条件的股票")
+                self.logger.info("未找到符合条件的股票（仅统计最近2天的数据）")
+                self.logger.info("注意：如果数据未更新，不会推送历史数据")
                 matched_count = 0
             else:
                 matched_count = len(results_df)
-                self.logger.info(f"找到 {matched_count} 只符合条件的股票")
+                self.logger.info(f"找到 {matched_count} 只符合条件的股票（最近2天）")
+                
+                # 显示数据日期范围
+                dates = pd.to_datetime(results_df['date'])
+                self.logger.info(f"数据日期范围: {dates.min().strftime('%Y-%m-%d')} 至 {dates.max().strftime('%Y-%m-%d')}")
                 
                 # 保存结果
                 output_file = os.path.join(
@@ -390,12 +408,14 @@ class VolumeAnalyzer:
             # 发送方糖推送
             if send_notification and self.notifier.enabled:
                 try:
+                    strategy_meta = {
+                        'ma_period': self.ma_period,
+                        'volume_ratio_threshold': self.volume_ratio,
+                        'from_validated': False
+                    }
+                    
                     if matched_stocks:
-                        strategy_meta = {
-                            'ma_period': self.ma_period,
-                            'volume_ratio_threshold': self.volume_ratio,
-                            'from_validated': False
-                        }
+                        # 有匹配的股票，发送正常通知
                         notify_success = self.notifier.send_analysis_result(
                             matched_stocks, analysis_date, 
                             include_history=True, 
@@ -406,7 +426,14 @@ class VolumeAnalyzer:
                         else:
                             self.logger.warning("方糖推送失败")
                     else:
-                        self.logger.info("无符合条件的股票，跳过方糖推送")
+                        # 没有匹配的股票，发送空通知
+                        notify_success = self.notifier.send_empty_analysis_result(
+                            analysis_date, strategy_meta
+                        )
+                        if notify_success:
+                            self.logger.info("已发送空结果方糖推送")
+                        else:
+                            self.logger.warning("空结果方糖推送失败")
                 except Exception as e:
                     self.logger.error(f"方糖推送异常: {e}")
             
