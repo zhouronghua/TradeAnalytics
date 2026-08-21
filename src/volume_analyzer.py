@@ -14,7 +14,7 @@ from typing import List, Dict, Optional
 # 添加父目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.utils import setup_logger, Config, ensure_dir, is_data_up_to_date, get_last_trading_day
+from src.utils import setup_logger, Config, ensure_dir, is_data_up_to_date
 from src.data_downloader import DataDownloader
 from src.notification import NotificationService
 from src.email_sender import EmailSender
@@ -279,7 +279,7 @@ class VolumeAnalyzer:
             # 步骤1: 更新数据
             if update_data:
                 self.logger.info("\n[步骤1/3] 更新交易数据...")
-                analysis_ref = get_last_trading_day(datetime.now())
+                analysis_ref = datetime.now()
                 up_to_date, status_msg = is_data_up_to_date(self.daily_dir, analysis_ref)
                 if up_to_date:
                     self.logger.info(f"跳过数据更新: {status_msg}")

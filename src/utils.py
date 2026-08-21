@@ -23,8 +23,9 @@ class Config:
     首次运行时若 config.ini 不存在，自动从 .example 拷贝。
     """
 
-    # 支持环境变量覆盖的敏感字段: (section, key) -> 环境变量名
+    # 支持环境变量覆盖的字段: (section, key) -> 环境变量名
     _ENV_MAP = {
+        ('DataSource', 'source'):      'TA_DATASOURCE_SOURCE',
         ('Email', 'sender_email'):    'TA_EMAIL_SENDER',
         ('Email', 'auth_code'):       'TA_EMAIL_AUTH',
         ('Email', 'receiver_emails'): 'TA_EMAIL_RECEIVER',
@@ -285,7 +286,9 @@ def is_data_up_to_date(daily_dir: str, reference_date: datetime = None) -> tuple
     """
     判断本地数据是否已更新到参考日期对应的最近交易日
 
-    数据源通常为 T+1，以「参考日上一自然日」对应的最近交易日作为可获得的目标日期。
+    以参考日期（含当天）之前的最近交易日作为目标日期，不在此处假定 T+1。
+    若数据源是 T+1（如 BaoStock），当日数据尚未发布时下载后本地仍停留在上一
+    交易日，这是数据源的时效限制，不应由本函数提前把目标日期回退一天。
 
     Returns:
         (是否最新, 状态说明)
@@ -293,9 +296,7 @@ def is_data_up_to_date(daily_dir: str, reference_date: datetime = None) -> tuple
     if reference_date is None:
         reference_date = datetime.now()
 
-    # T+1：当日收盘数据通常下一交易日才可用
-    data_reference = reference_date - timedelta(days=1)
-    expected_date = get_last_trading_day(data_reference)
+    expected_date = get_last_trading_day(reference_date)
     local_latest = get_local_latest_data_date(daily_dir)
 
     if local_latest is None:

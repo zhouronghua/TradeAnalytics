@@ -212,7 +212,7 @@ class TencentDataSource:
                         'close': float(item[2]),
                         'low': float(item[3]),
                         'high': float(item[4]),
-                        'volume': int(float(item[5]))  # 成交量（手）
+                        'volume': int(float(item[5])) * 100  # 成交量（手 -> 股，与 BaoStock 单位一致）
                     })
 
             if not df_data:
@@ -221,8 +221,8 @@ class TencentDataSource:
             df = pd.DataFrame(df_data)
 
             # 计算成交额（估算）
-            # 成交额 = 成交量(手) * 100 * 均价
-            df['amount'] = (df['volume'] * 100 * (df['open'] + df['close']) / 2).astype(int)
+            # volume 已换算为股数，成交额 = 股数 * 均价
+            df['amount'] = (df['volume'] * (df['open'] + df['close']) / 2).astype(int)
 
             # 转换日期格式
             df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')

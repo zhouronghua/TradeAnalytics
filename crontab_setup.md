@@ -39,8 +39,8 @@ crontab -e
 2. 添加定时任务（示例）：
 
 ```bash
-# 每个交易日下午3点30分执行成交量分析
-30 15 * * 1-5 cd /path/to/TradeAnalytics && /usr/bin/python3 src/volume_analyzer.py >> logs/volume_analyzer.log 2>&1
+# 每个交易日下午3点30分执行成交量分析（使用当日数据源）
+30 15 * * 1-5 cd /path/to/TradeAnalytics && git pull --ff-only && TA_DATASOURCE_SOURCE=tencent /usr/bin/python3 src/volume_analyzer.py >> logs/volume_analyzer.log 2>&1
 
 # 每天下午3点执行（包括周末，脚本内会判断交易日）
 0 15 * * * cd /path/to/TradeAnalytics && /usr/bin/python3 src/volume_analyzer.py >> logs/volume_analyzer.log 2>&1

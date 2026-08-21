@@ -6,10 +6,10 @@ results_dir = ./data/results
 logs_dir = ./logs
 
 [DataSource]
-# 数据源选择: akshare 或 baostock
-# akshare: 东方财富数据，实时性好但可能不稳定
-# baostock: 证券宝数据，更稳定可靠，推荐使用
-source = baostock
+# 数据源选择: tencent / akshare / baostock / tushare
+# tencent: 腾讯财经，收盘后即可获取当日数据，推荐用于 15:30 定时分析
+# baostock: 证券宝，T+1 数据（当日数据次日才可用）
+source = tencent
 update_stock_list_days = 1
 
 [Analysis]

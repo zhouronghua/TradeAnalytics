@@ -454,7 +454,9 @@ class DataDownloader:
             start_date = (latest_date + timedelta(days=1)).strftime('%Y%m%d')
             
             # 检查是否需要更新
-            if start_date >= datetime.now().strftime('%Y%m%d'):
+            # 注意：start_date == 今天时需要继续尝试下载当天数据。
+            # 腾讯/AkShare 等数据源在收盘后即可返回当日 K 线，若用 >= 会跳过当天。
+            if start_date > datetime.now().strftime('%Y%m%d'):
                 self.logger.debug(f"股票 {stock_code} 数据已是最新")
                 return True
             

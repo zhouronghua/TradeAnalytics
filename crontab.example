@@ -13,8 +13,9 @@
 # 基础配置 - 每个交易日下午3:30执行完整分析
 # ============================================================
 
-# 完整版：更新数据 + 分析 + 推送
-30 15 * * 1-5 cd /path/to/TradeAnalytics && /usr/bin/python3 src/volume_analyzer.py >> logs/volume_analyzer.log 2>&1
+# 完整版：更新代码 + 更新数据 + 分析 + 推送
+# TA_DATASOURCE_SOURCE=tencent 确保收盘后能取到当日数据（BaoStock 是 T+1，15:30 取不到当日）
+30 15 * * 1-5 cd /path/to/TradeAnalytics && git pull --ff-only && TA_DATASOURCE_SOURCE=tencent /usr/bin/python3 src/volume_analyzer.py >> logs/volume_analyzer.log 2>&1
 
 # ============================================================
 # 高级配置 - 分离数据更新和分析
